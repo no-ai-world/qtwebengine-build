@@ -440,7 +440,12 @@ set "JUMBO_FLAG="
 if "%JUMBO%"=="1" set "JUMBO_FLAG=-webengine-jumbo-build"
 pushd "%BUILD_DIR%"
 echo [step] qt-configure-module -webengine-proprietary-codecs; it downloads the Chromium toolchain
-call "%QT_PATH%\bin\qt-configure-module.bat" "%SRC_DIR%" -nomake examples -nomake tests -webengine-proprietary-codecs %JUMBO_FLAG% -- -DQT_SHOW_EXTRA_IDE_SOURCES=OFF -DCMAKE_INSTALL_PREFIX="%INSTALL_PREFIX%" -DCMAKE_BUILD_TYPE=%BUILD_TYPE%
+rem No -nomake examples/-nomake tests here: those belong to the top-level Qt configure
+rem script. qt-configure-module takes only -DFEATURE_* and, after "--", CMake arguments -
+rem passing -nomake fails with "Unknown command line option '-nomake'" (measured on
+rem Qt 6.8.3). A single-module build adds neither examples nor tests anyway, so there
+rem is nothing to turn off.
+call "%QT_PATH%\bin\qt-configure-module.bat" "%SRC_DIR%" -webengine-proprietary-codecs %JUMBO_FLAG% -- -DQT_SHOW_EXTRA_IDE_SOURCES=OFF -DCMAKE_INSTALL_PREFIX="%INSTALL_PREFIX%" -DCMAKE_BUILD_TYPE=%BUILD_TYPE%
 set "RC=%errorlevel%"
 popd
 if not "%RC%"=="0" (
