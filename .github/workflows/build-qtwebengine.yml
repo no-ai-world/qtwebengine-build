@@ -597,6 +597,16 @@ jobs:
           $lines.Add('| 运行标签 | ' + $env:RUNNER_LABEL + ' |')
           $lines.Add('| 本轮结局 | ' + $env:BUILD_RESULT + '（state: ' + $env:BUILD_STATE + '） |')
           $lines.Add('| ccache | ' + $env:CACHE_BACKEND + ' · 上限 ' + $env:CCACHE_MAX_SIZE + ' |')
+          # 命中率是"还能不能靠分轮续跑收口"的唯一直接指标，直接摊在作业页上，
+          # 免得每次都要翻日志里的 ccache 步骤。
+          $ccacheExe = Join-Path $env:TOOLS_BIN 'ccache.exe'
+          if ($env:USE_CCACHE -eq '1' -and (Test-Path -LiteralPath $ccacheExe)) {
+            $stats = & $ccacheExe --show-stats 2>$null
+            foreach ($key in 'Cacheable calls', 'Hits', 'Misses', 'Cache size (GB)') {
+              $hit = $stats | Select-String -Pattern ([regex]::Escape($key) + ':') | Select-Object -First 1
+              if ($hit) { $lines.Add('| ccache ' + $key + ' | ' + ($hit.Line -replace '^\s+', '') + ' |') }
+            }
+          }
           $zip = Join-Path $env:DIST_DIR "qtwebengine-$env:QT_VERSION-win64-msvc2022-codecs.zip"
           if (Test-Path $zip) {
             $lines.Add(('| 产物 | {0:N1} MB |' -f ((Get-Item $zip).Length / 1MB)))
