@@ -76,7 +76,7 @@ def build_report(probe: dict, expect_qt_version: str, pyside_version: str) -> di
     )
 
     return {
-        "timestamp": datetime.datetime.now(datetime.UTC).isoformat(timespec="seconds"),
+        "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds"),
         "python": sys.version.split()[0],
         "pyside6": pyside_version,
         "expected_qt_version": expect_qt_version,

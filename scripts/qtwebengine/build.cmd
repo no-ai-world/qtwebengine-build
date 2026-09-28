@@ -44,9 +44,13 @@ rem   STATE_FILE        default %WORK_ROOT%\build-state.txt
 rem   QT_VERSION        default 6.8.3
 rem   QTWEBENGINE_REF   default QT_VERSION
 rem   QT_SOURCE_URL     default https://github.com/qt/qtwebengine.git
-rem   BUILD_TYPE        default Release. Qt maps Release to the leanest Chromium
-rem                     symbols; RelWithDebInfo costs hours of build time and many
-rem                     GB here, for symbols a PySide6 wheel cannot use anyway;
+rem   BUILD_TYPE        default RelWithDebInfo. The installed Qt fixes the set of
+rem                     configurations this build tree may use (QtBuildInternalsExtra
+rem                     force-sets CMAKE_CONFIGURATION_TYPES to RelWithDebInfo;Debug),
+rem                     so this must be one of them - "Release" is not, and would
+rem                     build for hours and then fail at the install step. Of the two,
+rem                     only RelWithDebInfo produces unsuffixed DLL names that can be
+rem                     laid over a PySide6 wheel; Debug appends the debug postfix;
 rem   PARALLEL          default empty = all cores; CI passes a RAM-aware value
 rem   USE_CCACHE        default 1 = inject gn cc_wrapper="ccache"
 rem   CCACHE_DIR        default %WORK_ROOT%\ccache   (ccache.conf is written here)
@@ -76,8 +80,18 @@ echo [error] unknown phase "%PHASE%"; use all, prepare, build or finish
 exit /b 1
 
 :phase_all
+rem Stale state files from an earlier round must not be mistaken for this round's
+rem outcome: clear it, then let prepare/build record what actually happened.
+if exist "%STATE_FILE%" del "%STATE_FILE%"
 call :step_prepare
-if errorlevel 1 exit /b %errorlevel%
+if errorlevel 1 (
+    rem Same reason as in :phase_prepare: without a state file the caller reads this
+    rem deterministic failure as a time-out and queues another identical round.
+    if not exist "%WORK_ROOT%" mkdir "%WORK_ROOT%" 2>nul
+    > "%STATE_FILE%" echo failed 1
+    echo [error] prepare failed; state file says failed
+    exit /b 1
+)
 call :step_build
 if errorlevel 1 exit /b %errorlevel%
 call :step_finish
@@ -85,8 +99,24 @@ if errorlevel 1 exit /b %errorlevel%
 goto :done
 
 :phase_prepare
+rem Start from a clean slate. The prepare phase is deterministic and re-runnable, so any
+rem state file left by an earlier round is stale. Clearing it first means: killed while
+rem preparing -> no file -> "killed", resume later; prepare fails -> we write "failed"
+rem below -> the caller stops instead of queueing an identical round.
+if exist "%STATE_FILE%" del "%STATE_FILE%"
 call :step_prepare
-if errorlevel 1 exit /b %errorlevel%
+set "RC=%errorlevel%"
+if not "%RC%"=="0" (
+    rem Record the failure so the caller does not read an absent state file as "the
+    rem time budget ran out, try again". Without this the phases loop forever: every
+    rem deterministic prepare error - a bad configure flag, a broken tool shim - left
+    rem the file absent, the run reported "killed", and the next round failed the same
+    rem way.
+    if not exist "%WORK_ROOT%" mkdir "%WORK_ROOT%" 2>nul
+    > "%STATE_FILE%" echo failed %RC%
+    echo [error] prepare failed, code %RC%; state file says failed - no next round will be queued
+    exit /b %RC%
+)
 goto :done
 
 :phase_build
@@ -203,7 +233,7 @@ if not defined STATE_FILE set "STATE_FILE=%WORK_ROOT%\build-state.txt"
 if not defined QT_VERSION set "QT_VERSION=6.8.3"
 if not defined QTWEBENGINE_REF set "QTWEBENGINE_REF=%QT_VERSION%"
 if not defined QT_SOURCE_URL set "QT_SOURCE_URL=https://github.com/qt/qtwebengine.git"
-if not defined BUILD_TYPE set "BUILD_TYPE=Release"
+if not defined BUILD_TYPE set "BUILD_TYPE=RelWithDebInfo"
 if not defined CCACHE_DIR set "CCACHE_DIR=%WORK_ROOT%\ccache"
 if not defined CCACHE_MAX_SIZE set "CCACHE_MAX_SIZE=20G"
 rem Booleans accept both 1/0 and true/false; CI boolean inputs arrive as true/false
@@ -291,12 +321,16 @@ if errorlevel 1 (
 exit /b 0
 
 :check_tools
-rem Chromium's gn looks for tools named bison/flex, while winflexbison installs
-rem win_bison/win_flex. Shim them into our own dir rather than putting the whole
-rem winflexbison dir on PATH, where it would collide with MSYS2's bison, which the
-rem Qt docs explicitly warn against using.
-if not exist "%TOOLS_BIN%\bison.exe" for /f "delims=" %%i in ('where win_bison 2^>nul') do copy /y "%%i" "%TOOLS_BIN%\bison.exe" >nul
-if not exist "%TOOLS_BIN%\flex.exe" for /f "delims=" %%i in ('where win_flex 2^>nul') do copy /y "%%i" "%TOOLS_BIN%\flex.exe" >nul
+rem Chromium's gn and CMake look for tools named bison/flex, while winflexbison installs
+rem win_bison/win_flex. Bring those two names into TOOLS_BIN rather than putting the whole
+rem winflexbison dir on PATH, where it would collide with MSYS2's bison, which the Qt docs
+rem explicitly warn against using.
+rem Do not copy win_bison.exe itself when it comes from chocolatey: that file is a shim
+rem resolving its target through a path relative to its own location, so a copy dies with
+rem "Cannot find file at '..\lib\winflexbison3\tools\win_flex.exe'" - measured on the
+rem runner. :shim_bison_flex takes the real tools directory instead; it also carries
+rem bison's data/ files, which the real executables look up next to themselves.
+call :shim_bison_flex
 rem Qt's bin goes first: qt-configure-module must match the Qt DLLs it loads, and
 rem Qt's own Ninja is preferred over whatever the image ships. TOOLS_BIN follows,
 rem so the shims - and ccache, when the workflow drops it there - beat any
@@ -314,6 +348,49 @@ if exist "%MISSINGFILE%" (
     exit /b 1
 )
 echo [env] cl / cmake / ninja / node / perl / python / gperf / bison / flex all on PATH
+rem Presence is not enough. CMake's FindBISON/FindFLEX run "<tool> --version" and hard
+rem fail if it does not answer, and a chocolatey shim copy passes "where" but dies when
+rem executed - that is exactly how a round was lost: bison.exe was on PATH, the check
+rem said fine, and configure died minutes later. Run them here instead; bison must also
+rem find its data/ directory next to the executable, so use a real invocation.
+bison --version >nul 2>&1
+if errorlevel 1 (
+    echo [error] bison is on PATH but does not run: FindBISON will fail
+    echo [error] if it came from chocolatey, the shim was copied instead of the real tool
+    echo [error] run: where bison
+    exit /b 1
+)
+flex --version >nul 2>&1
+if errorlevel 1 (
+    echo [error] flex is on PATH but does not run: FindFLEX will fail
+    echo [error] run: where flex
+    exit /b 1
+)
+exit /b 0
+
+rem Put working bison/flex names into TOOLS_BIN. winflexbison's real tools directory is
+rem copied whole so the executables keep their data/ siblings, then the plain names are
+rem added as further copies. Called on every run so a stale or half-copied TOOLS_BIN heals.
+:shim_bison_flex
+set "WF_DIR="
+for /f "delims=" %%i in ('where win_bison 2^>nul') do if not defined WF_DIR set "WF_DIR=%%~dpi"
+if not defined WF_DIR exit /b 0
+rem A chocolatey shim sits in <choco>\bin and resolves to <choco>\lib\winflexbison3\tools
+set "WF_REAL="
+for %%i in ("%WF_DIR%..\lib\winflexbison3\tools") do if exist "%%~fi\win_bison.exe" set "WF_REAL=%%~fi"
+if defined WF_REAL (
+    echo [env] bison / flex   : "%WF_REAL%" - chocolatey shim resolved to the real tools
+    xcopy "%WF_REAL%\*" "%TOOLS_BIN%\" /e /i /q /y >nul
+    copy /y "%TOOLS_BIN%\win_bison.exe" "%TOOLS_BIN%\bison.exe" >nul
+    if exist "%TOOLS_BIN%\win_flex.exe" copy /y "%TOOLS_BIN%\win_flex.exe" "%TOOLS_BIN%\flex.exe" >nul
+) else (
+    echo [env] bison / flex   : "%WF_DIR%" - not a chocolatey shim, copied as-is
+    rem Bring bison's data/ along when it sits next to the executable: --version works
+    rem without it, but real parsing dies with "data/m4sugar/m4sugar.m4: cannot open".
+    if exist "%WF_DIR%data" xcopy "%WF_DIR%data" "%TOOLS_BIN%\data\" /e /i /q /y >nul
+    if not exist "%TOOLS_BIN%\bison.exe" copy /y "%WF_DIR%win_bison.exe" "%TOOLS_BIN%\bison.exe" >nul
+    if not exist "%TOOLS_BIN%\flex.exe" if exist "%WF_DIR%win_flex.exe" copy /y "%WF_DIR%win_flex.exe" "%TOOLS_BIN%\flex.exe" >nul
+)
 exit /b 0
 
 :ccache_setup
@@ -431,10 +508,16 @@ if errorlevel 1 (
 exit /b 0
 
 :configure
-if exist "%BUILD_DIR%\CMakeCache.txt" (
-    echo [step] CMakeCache.txt present, skipping configure; set RESET=1 to reconfigure
-    exit /b 0
-)
+if not exist "%BUILD_DIR%\CMakeCache.txt" goto :configure_run
+echo [step] CMakeCache.txt present, skipping configure; set RESET=1 to reconfigure
+rem Still validate: a cache left by an earlier round may have been configured with a
+rem BUILD_TYPE this tree cannot build and install. Checking here costs nothing and
+rem turns a multi-hour build-then-fail into an immediate error.
+call :assert_config
+if errorlevel 1 exit /b 1
+exit /b 0
+
+:configure_run
 mkdir "%BUILD_DIR%" 2>nul
 set "JUMBO_FLAG="
 if "%JUMBO%"=="1" set "JUMBO_FLAG=-webengine-jumbo-build"
@@ -445,6 +528,17 @@ rem script. qt-configure-module takes only -DFEATURE_* and, after "--", CMake ar
 rem passing -nomake fails with "Unknown command line option '-nomake'" (measured on
 rem Qt 6.8.3). A single-module build adds neither examples nor tests anyway, so there
 rem is nothing to turn off.
+rem -DCMAKE_BUILD_TYPE must be a configuration the installed Qt actually offers.
+rem This is a module build, so Qt's configure wrapper passes no -G and CMake picks its
+rem Windows default, "Visual Studio 17 2022" - a multi-config generator. Such a
+rem generator ignores CMAKE_BUILD_TYPE when it compiles, and the installed Qt force-sets
+rem CMAKE_CONFIGURATION_TYPES to "RelWithDebInfo;Debug" (measured: "Building for multiple
+rem configurations: RelWithDebInfo;Debug."). So the value here does not choose what gets
+rem compiled - --config does that in :build and :install - but it is read by Qt's
+rem get_install_config(), which prefers it over the configuration list. Naming a
+rem configuration that is not in that list (the old default, Release) makes the gn
+rem install rule target a configuration that does not exist. :assert_config below
+rem checks both facts before anything expensive starts.
 call "%QT_PATH%\bin\qt-configure-module.bat" "%SRC_DIR%" -webengine-proprietary-codecs %JUMBO_FLAG% -- -DQT_SHOW_EXTRA_IDE_SOURCES=OFF -DCMAKE_INSTALL_PREFIX="%INSTALL_PREFIX%" -DCMAKE_BUILD_TYPE=%BUILD_TYPE%
 set "RC=%errorlevel%"
 popd
@@ -456,16 +550,78 @@ if not exist "%BUILD_DIR%\CMakeCache.txt" (
     echo [error] configure reported success but produced no CMakeCache.txt
     exit /b 1
 )
+rem Fail in seconds rather than hours: confirm the configuration we will build and
+rem install is one this tree actually offers. --build and --install both take
+rem --config %BUILD_TYPE%, and a bare "cmake --build ." would silently pick Debug.
+call :assert_config
+if errorlevel 1 exit /b 1
 exit /b 0
+
+:assert_config
+rem Two shapes are possible: a multi-config tree lists CMAKE_CONFIGURATION_TYPES, a
+rem single-config tree has CMAKE_BUILD_TYPE. Compare at top level only - inside a
+rem parenthesised block %VAR% is expanded when the block is parsed, so a value set in
+rem the same block cannot be read back there (this script does not enable delayed
+rem expansion).
+rem
+rem CMAKE_BUILD_TYPE is checked as well, even in a multi-config tree where it does not
+rem select what compiles: Qt's get_install_config() reads it first, so a value that
+rem disagrees with BUILD_TYPE silently gives an install rule for the wrong
+rem configuration. That mismatch is what an earlier round shipped.
+set "BT_LINE="
+for /f "usebackq tokens=1,* delims==" %%a in (`findstr /b /c:"CMAKE_BUILD_TYPE:" "%BUILD_DIR%\CMakeCache.txt"`) do set "BT_LINE=%%b"
+if not defined BT_LINE goto :assert_config_skip_bt
+if /i not "%BT_LINE%"=="%BUILD_TYPE%" goto :assert_config_bt_mismatch
+
+:assert_config_skip_bt
+findstr /b /c:"CMAKE_CONFIGURATION_TYPES:" "%BUILD_DIR%\CMakeCache.txt" >nul
+if errorlevel 1 goto :assert_config_single
+set "CFG_LINE="
+for /f "usebackq tokens=1,* delims==" %%a in (`findstr /b /c:"CMAKE_CONFIGURATION_TYPES:" "%BUILD_DIR%\CMakeCache.txt"`) do set "CFG_LINE=%%b"
+if not defined CFG_LINE goto :assert_config_unknown
+echo [env] configuration set: %CFG_LINE%
+echo %CFG_LINE% | findstr /i /c:"%BUILD_TYPE%" >nul
+if errorlevel 1 goto :assert_config_bad
+rem Debug output carries CMAKE_DEBUG_POSTFIX, so its DLLs cannot be laid over PySide6.
+if /i "%BUILD_TYPE%"=="Debug" echo [warn] BUILD_TYPE=Debug: DLLs get the debug postfix and cannot overlay PySide6
+echo [env] configuration  : %BUILD_TYPE% - verified present
+exit /b 0
+
+:assert_config_single
+if /i not "%BT_LINE%"=="%BUILD_TYPE%" goto :assert_config_unknown
+echo [env] configuration  : %BUILD_TYPE% - single-config generator
+exit /b 0
+
+:assert_config_bad
+echo [error] BUILD_TYPE=%BUILD_TYPE% is not one of the configurations this tree offers
+echo [error] the installed Qt decides that set; pick one of the values printed above,
+echo [error] or delete "%BUILD_DIR%" and configure again
+exit /b 1
+
+:assert_config_bt_mismatch
+echo [error] CMakeCache.txt has CMAKE_BUILD_TYPE=%BT_LINE% but this run builds %BUILD_TYPE%
+echo [error] Qt's get_install_config() prefers CMAKE_BUILD_TYPE, so the install rules
+echo [error] would be generated for %BT_LINE% and the output would not be installed
+echo [error] delete "%BUILD_DIR%" and run the prepare phase again
+exit /b 1
+
+:assert_config_unknown
+echo [error] cannot determine the configuration of "%BUILD_DIR%\CMakeCache.txt"
+echo [error] CMAKE_CONFIGURATION_TYPES is absent and CMAKE_BUILD_TYPE is not %BUILD_TYPE%
+exit /b 1
 
 :build
 pushd "%BUILD_DIR%"
+rem --config is mandatory here. This tree uses the Visual Studio generator, and for a
+rem multi-config generator a bare "cmake --build ." builds Debug (cmVS10Gen.cxx: with an
+rem empty config it substitutes "Debug"). Debug output carries the debug postfix, so the
+rem install step below, which asks for %BUILD_TYPE%, would find nothing to install.
 if defined PARALLEL (
-    echo [step] cmake --build . --parallel %PARALLEL%
-    call cmake --build . --parallel %PARALLEL%
+    echo [step] cmake --build . --config %BUILD_TYPE% --parallel %PARALLEL%
+    call cmake --build . --config %BUILD_TYPE% --parallel %PARALLEL%
 ) else (
-    echo [step] cmake --build . --parallel
-    call cmake --build . --parallel
+    echo [step] cmake --build . --config %BUILD_TYPE% --parallel
+    call cmake --build . --config %BUILD_TYPE% --parallel
 )
 set "RC=%errorlevel%"
 popd

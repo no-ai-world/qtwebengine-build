@@ -30,7 +30,7 @@ git commit -m "feat: QtWebEngine 私有编解码器构建流水线"
 gh repo create <owner>/qtwebengine-build --private --source . --push
 ```
 
-然后在 Actions → **build-qtwebengine** → Run workflow。默认参数就是 Qt 6.8.3 + Release + ccache。
+然后在 Actions → **build-qtwebengine** → Run workflow。默认参数就是 Qt 6.8.3 + RelWithDebInfo + ccache。
 
 ## 运行环境（门槛在这儿，不在时间）
 

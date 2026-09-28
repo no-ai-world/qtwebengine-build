@@ -29,7 +29,7 @@
 #
 # 运行环境要求（触发前请先读这一段）
 #   * 磁盘（这是本方案真正的门槛，不是时间）：Chromium 源码+子模块约 40 GB、
-#     构建中间产物（Release、symbol_level 归零后）约 20-40 GB、Qt 与下载的 Chromium
+#     构建中间产物（symbol_level 归零后）约 20-40 GB、Qt 与下载的 Chromium
 #     工具链约 10 GB，合计 70-90 GB；ccache 另需 cache_max_size 那么多。
 #     文档口径的标准托管 runner 是 14 GB SSD，实测的 windows-2022 也只有几十 GB 可用，
 #     所以：要么用大规格 runner（larger runners，300 GB+ SSD），要么自托管。
@@ -75,12 +75,12 @@ on:
         type: string
         default: 'windows-2022'
       build_type:
-        description: 'CMake 构建类型。Release 符号最少、最快、最省盘；RelWithDebInfo 会多花数小时与几十 GB'
+        description: 'CMake 构建类型。只能选已安装 Qt 提供的配置：RelWithDebInfo 产物名不带后缀、可覆盖 PySide6；Debug 带调试后缀、无法覆盖。两者都开 is_official_build + blink/v8 symbol_level=0。'
         type: choice
         options:
-          - Release
           - RelWithDebInfo
-        default: 'Release'
+          - Debug
+        default: 'RelWithDebInfo'
       use_ccache:
         description: '开启 ccache（分轮续跑与快速迭代都依赖它）'
         type: boolean
@@ -384,6 +384,7 @@ jobs:
           }
 
       - name: 准备阶段（环境 / 源码 / 补丁 / configure）
+        id: prepare
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Path $env:DIST_DIR -Force | Out-Null
@@ -406,6 +407,7 @@ jobs:
           Write-Host "构建阶段退出码：$LASTEXITCODE"
 
       - name: ccache 是否真的生效（对照 gn cc_wrapper 注入）
+        id: ccachecheck
         if: ${{ always() && inputs.use_ccache }}
         shell: pwsh
         run: |
@@ -438,7 +440,16 @@ jobs:
         shell: pwsh
         run: |
           $state = if (Test-Path $env:STATE_FILE) { (Get-Content -LiteralPath $env:STATE_FILE -Raw).Trim() } else { '' }
-          $result = if ($state -like 'ok*') { 'ok' } elseif ($state -like 'failed*') { 'failed' } else { 'killed' }
+          # build.cmd writes "failed" for every deterministic error, so an absent state
+          # file normally means the time budget cut the step off. One case still needs
+          # the workflow's own evidence: if the prepare step itself failed - cmd.exe
+          # refused to start, the script was missing - build.cmd never ran and left no
+          # file. Reading that as "killed" is what made a broken round re-dispatch
+          # itself forever, so treat a failed prepare step as a failure too.
+          $result = if ($state -like 'ok*') { 'ok' }
+                    elseif ($state -like 'failed*') { 'failed' }
+                    elseif ('${{ steps.prepare.outcome }}' -eq 'failure') { 'failed' }
+                    else { 'killed' }
           "BUILD_RESULT=$result" >> $env:GITHUB_ENV
           "BUILD_STATE=$state" >> $env:GITHUB_ENV
           "result=$result" >> $env:GITHUB_OUTPUT
@@ -596,13 +607,15 @@ jobs:
           fail_on_unmatched_files: true
 
       - name: 未完则给出下一轮（并按需自动派发）
-        if: ${{ always() && steps.verdict.outputs.result == 'killed' }}
+        # ccache 一步报错说明这一轮一次编译都没发生，续跑只会在同一个报错上再烧一轮，
+        # 所以那种情况不派发（判定写的是 failed 时本来也不该派发）。
+        if: ${{ always() && steps.verdict.outputs.result == 'killed' && steps.ccachecheck.outcome != 'failure' }}
         shell: pwsh
         env:
           CACHE_TOKEN: ${{ secrets.CACHE_TOKEN }}
           AUTO_CONTINUE: ${{ inputs.auto_continue && '1' || '0' }}
         run: |
-          $next = [int]$env.ROUND_LABEL + 1
+          $next = [int]$env:ROUND_LABEL + 1
           Write-Host '本轮被时间预算打断，缓存已回写。下一轮：'
           Write-Host "  gh workflow run build-qtwebengine.yml -f round=$next -f qt_version=$env:QT_VERSION"
           if ($env:AUTO_CONTINUE -ne '1') { exit 0 }
@@ -611,14 +624,33 @@ jobs:
             exit 0
           }
           $env:GH_TOKEN = $env:CACHE_TOKEN
+          # 续跑必须带上所有会改变构建结果的输入。漏掉 build_type 会让第 2 轮换一个
+          # 配置去编，ccache 里的条目几乎全部作废（等于又从头编一遍）；漏掉
+          # skip_patch / shallow_submodule / qtwebengine_ref 会让源码状态和第 1 轮不同。
+          # 漏掉 auto_continue 则续跑只走一轮就断链。
           gh workflow run build-qtwebengine.yml `
             -f round=$next `
             -f qt_version=$env:QT_VERSION `
+            -f qtwebengine_ref='${{ inputs.qtwebengine_ref }}' `
+            -f pyside_version='${{ inputs.pyside_version }}' `
             -f runner='${{ inputs.runner }}' `
+            -f build_type='${{ inputs.build_type }}' `
             -f cache_backend=$env:CACHE_BACKEND `
             -f cache_repo='${{ inputs.cache_repo }}' `
+            -f ccache_max_size='${{ inputs.ccache_max_size }}' `
+            -f ccache_version='${{ inputs.ccache_version }}' `
             -f build_budget_minutes='${{ inputs.build_budget_minutes }}' `
             -f use_ccache=${{ inputs.use_ccache }} `
-            -f jumbo=${{ inputs.jumbo }}
+            -f jumbo=${{ inputs.jumbo }} `
+            -f parallel='${{ inputs.parallel }}' `
+            -f shallow_submodule=${{ inputs.shallow_submodule }} `
+            -f skip_patch=${{ inputs.skip_patch }} `
+            -f min_free_gb='${{ inputs.min_free_gb }}' `
+            -f pagefile_gb='${{ inputs.pagefile_gb }}' `
+            -f skip_preflight=${{ inputs.skip_preflight }} `
+            -f timeout_minutes='${{ inputs.timeout_minutes }}' `
+            -f auto_continue=${{ inputs.auto_continue }} `
+            -f create_release=${{ inputs.create_release }} `
+            -f release_tag='${{ inputs.release_tag }}'
           if ($LASTEXITCODE -ne 0) { throw '自动派发下一轮失败' }
           Write-Host "已派发第 $next 轮"
