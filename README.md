@@ -30,7 +30,7 @@ git commit -m "feat: QtWebEngine 私有编解码器构建流水线"
 gh repo create <owner>/qtwebengine-build --private --source . --push
 ```
 
-然后在 Actions → **build-qtwebengine** → Run workflow。默认参数就是 Qt 6.8.3 + RelWithDebInfo + ccache。
+然后在 Actions → **build-qtwebengine** → Run workflow。默认参数就是 Qt 6.8.3 + RelWithDebInfo、只编一个配置、ccache 关闭（原因见下）。
 
 ## 运行环境（门槛在这儿，不在时间）
 
@@ -43,16 +43,25 @@ gh repo create <owner>/qtwebengine-build --private --source . --push
 标准 GitHub 托管 runner（文档标称 14 GB SSD）装不下，别拿它试。预检会先量盘，不达标直接失败并打印三条出路：
 大规格 runner（larger runners，300 GB+ SSD）／自托管 Windows 机器／本地直接跑 `scripts/qtwebengine/build.cmd`。
 
-## 一轮编不完怎么办：ccache + 分轮续跑
+## 一轮编不完怎么办：现状是「一轮编完」，不是分轮续跑
 
-做法取自 kiwi browser 的 CI（<https://github.com/AoEiuV020/kiwibrowser-build>）。要点是「一轮」不等于「一次构建」：
+本来照 kiwi browser 的 CI（<https://github.com/AoEiuV020/kiwibrowser-build>）做了 ccache + 分轮续跑，**实测这条路在本方案里走不通**：
 
-1. `build.cmd` 拆成 **prepare / build / finish** 三阶段，阶段之间只靠 ccache 传递进度；
-2. 注入 gn 参数 `cc_wrapper="ccache"`，让 Chromium 的编译器缓存真的生效
-   （Windows 上 Chromium 用自带 clang-cl，`chromium/build/toolchain/win/toolchain.gni` 里 `cl_prefix` 会拼上 cc_wrapper）；
-3. `build` 阶段带**时间预算**（默认 300 分钟），到点被作业步超时打断；
-4. 每轮结束把 ccache 回写到外部存储，下一轮取回来接着编；
-5. 冷缓存要若干轮收敛，缓存热了之后一轮编完并打包。
+1. Chromium 的 `cc_wrapper` 只被 gcc/clang 工具链读取，而 QtWebEngine 在 Windows 上用 MSVC，工具链不看它。
+   证据：`args.gn` 里确实写进了 `cc_wrapper="ccache"`（已核对构建日志），但编到 `[8038/29705]` 之后
+   `ccache --show-stats` 显示缓存仍是 `0.0 GB`，`Cacheable calls` 一项根本不存在——一次都没被调用。
+2. runner 每次都是干净的，构建目录（几十 GB）不跨轮保留，10–20 GB 的缓存配额也放不下；
+   所以被时间预算打断就等于这一轮白编。
+
+因此现在的策略是**一轮编完**，为此做了两件事：
+
+1. **只编一个配置。** VS 是多配置生成器，装了 Qt 之后 `CMAKE_CONFIGURATION_TYPES` 被强制设成
+   `RelWithDebInfo;Debug`；QtWebEngine 给每个配置都接一棵 gn/ninja 树、互为 `WebEngineCore` 的依赖，
+   于是整个 Chromium 要编两遍（实测：第一棵树 56 分钟编到 `8038/29705`，第二棵排队等着）。
+   `patch-single-config.ps1` 把配置集收成一个；`build.cmd` 在 configure 后立刻校验，收窄没生效就秒失败。
+2. **时间预算给足。** `build_budget_minutes` 默认 300 分钟——打断了没有第二次机会。
+
+`use_ccache` 因此默认关闭；开着只会在 ccache 一步报错（那是有意的：它在告诉你这个开关没用）。
 
 三种结局由 `STATE_FILE` 区分，别改名：
 
@@ -60,9 +69,11 @@ gh repo create <owner>/qtwebengine-build --private --source . --push
 | --- | --- | --- |
 | `ok` | 编完了 | 继续 finish / 打包 / 编解码验收 /（可选）发 Release |
 | `failed <code>` | 编译报错，或根本没进到编译（环境/工具/未 configure） | 直接失败，**不排下一轮**（否则会在坏代码上无限轮下去） |
-| 不存在 | 被时间预算打断 | 回写缓存并排下一轮 |
+| 不存在 | 被时间预算打断（含被步超时杀掉的 `0xC000013A`） | 排下一轮；但注意上面说的：没有编译器缓存，下一轮是从头编 |
 
 ### 缓存存哪儿：两个后端
+
+`CCACHE_DIR` 的存取仍然可用（`actions-cache` 免密钥、`git-repo` 更大），但在 MSVC 下它缓存不到东西。
 
 | 后端 | 上限 | 需要密钥 | 适用 |
 | --- | --- | --- | --- |

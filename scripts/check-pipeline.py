@@ -201,6 +201,37 @@ def check_build_cmd(root: Path) -> None:
     if "flex --version" not in text:
         fail("build.cmd/tools", "flex is never executed before configure (FindFLEX runs it)")
 
+    # 10. 被时间预算打断不能记成 failed。步超时会把进程树打掉，cmake 以 0xC000013A
+    #     （-1073741510）返回；那是一次中断，不是编译错误。曾经它被写成 failed，
+    #     于是编到 [8038/29705] 的那一轮被判成「失败、不再排下一轮」。
+    blk = label_block(":build") or ""
+    if "-1073741510" not in blk:
+        fail(
+            "build.cmd/state",
+            ":build does not treat the step-timeout exit code (0xC000013A, "
+            "-1073741510) as an interruption; a round cut off by the time budget is "
+            "recorded as failed and never resumed",
+        )
+    else:
+        i_int = blk.find("-1073741510")
+        i_failw = blk.find('> "%STATE_FILE%" echo failed')
+        if 0 <= i_failw < i_int:
+            fail("build.cmd/state", ":build writes 'failed' before checking the interruption code")
+
+    # 11. 必须只编一个配置。VS 是多配置生成器，Qt 把配置集设成 RelWithDebInfo;Debug，
+    #     而 QtWebEngine 每个配置接一棵 gn/ninja 树且互为 WebEngineCore 的依赖，
+    #     于是整个 Chromium 编两遍（实测第一棵树 56 分钟编到 8038/29705，第二棵排队）。
+    if 'if /i not "%CFG_LINE%"=="%BUILD_TYPE%" goto :assert_config_multi' not in text:
+        fail("build.cmd/config", ":assert_config does not require exactly one configuration")
+    if "patch-single-config.ps1" not in text:
+        fail("build.cmd/config", "the single-config patch is never applied")
+    if "-DQTWE_BUILD_CONFIGURATION=%BUILD_TYPE%" not in text:
+        fail(
+            "build.cmd/config",
+            "configure does not receive -DQTWE_BUILD_CONFIGURATION, so the narrowing "
+            "block the patch injects cannot do anything",
+        )
+
 
 # ---------------------------------------------------------------------------
 # workflow

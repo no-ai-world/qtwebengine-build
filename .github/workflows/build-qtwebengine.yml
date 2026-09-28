@@ -12,20 +12,23 @@
 #   自建一份运行时才能改掉这一点。
 #
 # 一轮跑不完怎么续（这条是照 kiwi browser 的做法来的：ccache + 分轮 + 缓存外存）
-#   一个 6 小时的作业装不下 Chromium 级构建，但「一轮」不必等于「一次构建」：
-#     1) build.cmd 被拆成 prepare / build / finish 三个阶段，阶段之间只靠 ccache 传递进度；
-#     2) 注入 gn 参数 cc_wrapper="ccache"，让 Chromium 的编译器缓存真的生效
-#        （见 scripts/qtwebengine/patch-gn-args.ps1：Windows 上 Chromium 用自带 clang-cl，
-#          chromium/build/toolchain/win/toolchain.gni 里 cl_prefix 会拼上 cc_wrapper）；
-#     3) 每轮的 build 阶段带一个时间预算（默认 300 分钟），到点被步超时打断，
-#        此时源码与中间产物都丢弃，但 ccache 已经积累了这一轮编完的目标文件；
-#     4) 每轮结束把 ccache 存到外部（见 cache_backend），下一轮取回来接着编；
-#     5) 冷缓存要若干轮才收敛，缓存热了之后一轮就能编完并打包——kiwi 的经验是一小时出头。
+#   ⚠ 实测结论：ccache 这条路在本方案里走不通，别指望分轮续跑。
+#     Chromium 的 cc_wrapper 只被 gcc/clang 工具链读取；QtWebEngine 在 Windows 上
+#     用 MSVC，工具链不看这个变量。证据：args.gn 里确实有 cc_wrapper="ccache"
+#     （已核对构建日志），但编译到 [8038/29705] 之后 ccache 缓存仍是 0.0 GB，
+#     ccache --show-stats 连 "Cacheable calls" 一项都不存在——一次都没被调用。
+#     runner 每次都是干净的，构建目录不跨轮保留，所以被时间预算打断 = 这一轮白编。
+#   因此现在的策略是：一轮编完。为此做了两件事：
+#     1) 只编一个配置。VS 是多配置生成器，装了 Qt 之后 CMAKE_CONFIGURATION_TYPES 被
+#        强制设成 RelWithDebInfo;Debug；QtWebEngine 每个配置都接一棵 gn/ninja 树、
+#        互为 WebEngineCore 的依赖，于是两个配置都要编（实测：第一棵树 56 分钟编到
+#        8038/29705，第二棵排队等着）。patch-single-config.ps1 把配置集收成一个。
+#     2) build 阶段的时间预算给足（默认 300 分钟），因为打断了就没有第二次机会。
 #   轮次之间靠 STATE_FILE 区分三种结局：
 #     ok         = 编完了，继续 finish / 打包 / 验收
 #     failed N   = 编译报错或根本没进到编译（环境/工具/未 configure），直接失败，
 #                  不进入下一轮（否则会在坏代码上无限轮下去）
-#     文件不存在 = 被时间预算打断，存缓存 + 排下一轮
+#     文件不存在 = 被时间预算打断（含被步超时杀掉的 0xC000013A），可排下一轮
 #
 # 运行环境要求（触发前请先读这一段）
 #   * 磁盘（这是本方案真正的门槛，不是时间）：Chromium 源码+子模块约 40 GB、
@@ -82,9 +85,9 @@ on:
           - Debug
         default: 'RelWithDebInfo'
       use_ccache:
-        description: '开启 ccache（分轮续跑与快速迭代都依赖它）'
+        description: '开启 ccache（往 gn 注入 cc_wrapper）。实测在 Windows/MSVC 下无效：编译到 8038/29705 个目标后 ccache 缓存仍是 0.0 GB，Chromium 的 cc_wrapper 只被 gcc/clang 工具链读取，MSVC 工具链不看它。因此默认关闭——开着只会在 ccache 一步报错'
         type: boolean
-        default: true
+        default: false
       cache_backend:
         description: '缓存存哪儿：actions-cache 受仓库 10 GB 配额限制；git-repo 存到独立仓库（kiwi 的做法，需要 CACHE_TOKEN）'
         type: choice

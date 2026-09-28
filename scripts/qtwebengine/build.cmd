@@ -488,17 +488,23 @@ if "%SKIP_PATCH%"=="1" (
     echo [step] SKIP_PATCH=1: skipping patches
     exit /b 0
 )
-echo [step] patch 1/2: Chromium cppgc - MSVC 14.44 reports C2352 on Qt 6.8.3 V8
+echo [step] patch 1/3: Chromium cppgc - MSVC 14.44 reports C2352 on Qt 6.8.3 V8
 call :run_ps patch-cppgc.ps1 -SourceRoot "%SRC_DIR%"
 if errorlevel 1 (
     echo [error] cppgc patch failed
     exit /b 1
 )
+echo [step] patch 2/3: single configuration - the VS generator would build RelWithDebInfo and Debug
+call :run_ps patch-single-config.ps1 -SourceRoot "%SRC_DIR%"
+if errorlevel 1 (
+    echo [error] single-config patch failed
+    exit /b 1
+)
 if "%USE_CCACHE%"=="1" (
-    echo [step] patch 2/2: gn cc_wrapper=ccache into src/core/CMakeLists.txt
+    echo [step] patch 3/3: gn cc_wrapper=ccache into src/core/CMakeLists.txt
     call :run_ps patch-gn-args.ps1 -SourceRoot "%SRC_DIR%" -UseCcache
 ) else (
-    echo [step] patch 2/2: clearing previously injected gn args
+    echo [step] patch 3/3: clearing previously injected gn args
     call :run_ps patch-gn-args.ps1 -SourceRoot "%SRC_DIR%"
 )
 if errorlevel 1 (
@@ -539,7 +545,7 @@ rem get_install_config(), which prefers it over the configuration list. Naming a
 rem configuration that is not in that list (the old default, Release) makes the gn
 rem install rule target a configuration that does not exist. :assert_config below
 rem checks both facts before anything expensive starts.
-call "%QT_PATH%\bin\qt-configure-module.bat" "%SRC_DIR%" -webengine-proprietary-codecs %JUMBO_FLAG% -- -DQT_SHOW_EXTRA_IDE_SOURCES=OFF -DCMAKE_INSTALL_PREFIX="%INSTALL_PREFIX%" -DCMAKE_BUILD_TYPE=%BUILD_TYPE%
+call "%QT_PATH%\bin\qt-configure-module.bat" "%SRC_DIR%" -webengine-proprietary-codecs %JUMBO_FLAG% -- -DQT_SHOW_EXTRA_IDE_SOURCES=OFF -DCMAKE_INSTALL_PREFIX="%INSTALL_PREFIX%" -DCMAKE_BUILD_TYPE=%BUILD_TYPE% -DQTWE_BUILD_CONFIGURATION=%BUILD_TYPE%
 set "RC=%errorlevel%"
 popd
 if not "%RC%"=="0" (
@@ -582,9 +588,17 @@ if not defined CFG_LINE goto :assert_config_unknown
 echo [env] configuration set: %CFG_LINE%
 echo %CFG_LINE% | findstr /i /c:"%BUILD_TYPE%" >nul
 if errorlevel 1 goto :assert_config_bad
+rem It must also be the ONLY configuration. The Visual Studio generator builds every
+rem configuration in this list, and QtWebEngine wires one gn/ninja tree per entry with
+rem each one a dependency of WebEngineCore - so two entries compile the whole of
+rem Chromium twice (measured: the first tree reached 8038/29705 in 56 minutes with the
+rem second queued behind it). That runtime is never used: only the requested
+rem configuration is installed. patch-single-config.ps1 narrows the list; if it did not
+rem take effect, fail here in seconds instead of after hours.
+if /i not "%CFG_LINE%"=="%BUILD_TYPE%" goto :assert_config_multi
 rem Debug output carries CMAKE_DEBUG_POSTFIX, so its DLLs cannot be laid over PySide6.
 if /i "%BUILD_TYPE%"=="Debug" echo [warn] BUILD_TYPE=Debug: DLLs get the debug postfix and cannot overlay PySide6
-echo [env] configuration  : %BUILD_TYPE% - verified present
+echo [env] configuration  : %BUILD_TYPE% - verified present and single
 exit /b 0
 
 :assert_config_single
@@ -600,8 +614,19 @@ exit /b 1
 
 :assert_config_bt_mismatch
 echo [error] CMakeCache.txt has CMAKE_BUILD_TYPE=%BT_LINE% but this run builds %BUILD_TYPE%
-echo [error] Qt's get_install_config() prefers CMAKE_BUILD_TYPE, so the install rules
+echo [error] Qt's get_install_config prefers CMAKE_BUILD_TYPE, so the install rules
 echo [error] would be generated for %BT_LINE% and the output would not be installed
+echo [error] delete "%BUILD_DIR%" and run the prepare phase again
+exit /b 1
+
+:assert_config_multi
+echo [error] CMAKE_CONFIGURATION_TYPES is "%CFG_LINE%" but must be exactly "%BUILD_TYPE%"
+echo [error] the Visual Studio generator builds every configuration in that list, and
+echo [error] QtWebEngine wires one gn/ninja tree per entry, each a dependency of
+echo [error] WebEngineCore, so two entries compile the whole of Chromium twice
+echo [error] patch-single-config.ps1 must inject a CMAKE_CONFIGURATION_TYPES FORCE set
+echo [error] after the Qt6 find_package in "%SRC_DIR%\CMakeLists.txt", and configure
+echo [error] must receive -DQTWE_BUILD_CONFIGURATION=%BUILD_TYPE%
 echo [error] delete "%BUILD_DIR%" and run the prepare phase again
 exit /b 1
 
@@ -625,6 +650,18 @@ if defined PARALLEL (
 )
 set "RC=%errorlevel%"
 popd
+rem 0xC000013A (STATUS_CONTROL_C_EXIT, arrives here as -1073741510) is what cmake
+rem returns when the step's time budget cancels the process tree. Measured: the round
+rem that compiled to [8038/29705] and was cut off at 60 minutes recorded
+rem "failed -1073741510" and the caller therefore refused to queue a next round, even
+rem though nothing was wrong with the build. An interruption is not a compile error:
+rem leave STATE_FILE absent, which is what the caller reads as "killed, resume later".
+rem A genuine compile error arrives here as ninja's small positive exit code via cmake,
+rem never as this one, so this cannot mask a real failure.
+if "%RC%"=="-1073741510" (
+    echo [step] interrupted by the step time budget; state file left absent so the next round resumes
+    exit /b 5
+)
 if "%RC%"=="0" (
     > "%STATE_FILE%" echo ok
     echo [step] build completed; state file says ok
