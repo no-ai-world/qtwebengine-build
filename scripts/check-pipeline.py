@@ -399,6 +399,14 @@ def check_ccache_wiring(root: Path) -> None:
         fail("ccache/wiring", "workflow 没有启动 watch-build.ps1：卡死之后又只能靠猜")
     if not (root / WATCH_BUILD).is_file():
         fail("ccache/wiring", f"缺少 {WATCH_BUILD}")
+    # 它还得拿到判断依据：ninja 规则所在目录、时间预算，以及允许在死缓存上停手。
+    for needle, why in (
+        ("'-BuildDir', $env:BUILD_DIR", "看门狗拿不到构建目录，就没法判断 wrapper 有没有进 ninja 规则"),
+        ("'-AbortOnDeadCache'", "看门狗不能在「缓存肯定没有、且这一轮编不完」时停手"),
+        ("'-BudgetMinutes'", "看门狗不知道时间预算，就无法判断这一轮还编不编得完"),
+    ):
+        if needle not in workflow:
+            fail("ccache/wiring", f"{why}（缺 {needle}）")
 
     # 4. ninja 自己的默认并行度是 cores+2；在 4 核/16 GB 的 runner 上，这个数字就是
     #    决定「换页卡死」还是「编完」的内存上限。

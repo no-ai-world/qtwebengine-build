@@ -79,9 +79,11 @@ ccache 不行，而是少接了一根线：
 （prepare 退出码 4），不会等到五小时之后才发现缓存是空的。
 
 构建阶段还有 `watch-build.ps1` 看门狗：每 5 分钟往日志写一行「最后完成的目标、日志静默多久、
-可用内存、cl/mspdbsrv 的进程数与占用、ccache 计数」，另存 `watch-roundN.log` 进产物。它只观察、
-不杀构建；唯一的副作用是发现「编译在跑但 ccache 计数为 0」时落一个 `ccache-not-bound.txt`，
-`build.cmd` 见到它就把本轮记成 `failed` 而不是超时——免得空缓存无限续跑。
+可用内存、cl/mspdbsrv 的进程数与占用、ccache 计数」，并直接读 GN 生成的 ninja 规则判断 wrapper
+有没有进编译器命令行（`wrapper=ccache BOUND/MISSING`），另存 `watch-roundN.log` 进产物。
+它平时只观察；只有在两个独立信号一致——规则里没有 wrapper **且** ccache 计数为 0——时才动手：
+落一个 `ccache-not-bound.txt` 让 `build.cmd` 把本轮记成 `failed`（而不是超时后无限续跑），
+并停掉编译器进程，把一轮五小时缩成几分钟。
 
 时间预算照旧：`build_budget_minutes` 默认 300 分钟。够不够一轮编完要看实测；不够就靠 ccache 分轮，
 `auto_continue` 这才重新有意义（仍需要 `CACHE_TOKEN`）。

@@ -423,8 +423,14 @@ jobs:
           $watchOut = Join-Path $env:DIST_DIR "watch-round${{ inputs.round }}.log"
           $watch = $null
           if (Test-Path $watchScript) {
+            # -BuildDir 让看门狗能直接读 GN 生成的 ninja 规则，判断 wrapper 有没有进编译器
+            # 命令行（不依赖 CMake target 名字）；-AbortOnDeadCache 只在两个独立信号一致
+            # ——规则里没有 wrapper，且 ccache 计数为 0——时才停掉编译器，把一轮五小时
+            # 缩成几分钟，并且由 build.cmd 记成 failed 而不是超时。
             $watchArgs = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $watchScript,
-                           '-LogFile', $log, '-OutFile', $watchOut, '-WorkRoot', $env:WORK_ROOT)
+                           '-LogFile', $log, '-OutFile', $watchOut, '-WorkRoot', $env:WORK_ROOT,
+                           '-BuildDir', $env:BUILD_DIR, '-BudgetMinutes', '${{ inputs.build_budget_minutes }}',
+                           '-AbortOnDeadCache')
             $ccacheExe = Join-Path $env:TOOLS_BIN 'ccache.exe'
             if (Test-Path $ccacheExe) { $watchArgs += @('-CcacheExe', $ccacheExe) }
             $watch = Start-Process -FilePath 'pwsh' -ArgumentList $watchArgs -NoNewWindow -PassThru

@@ -3,24 +3,33 @@
     Watchdog for the build phase: progress, silence, memory pressure and cache activity.
 
 .DESCRIPTION
-    The build phase gets a 300 minute budget, so a single stall can eat the whole round.
-    That is not hypothetical: a round sat with the ninja counter frozen for a long time
-    while the last line in the log was an ACTION that had already finished, and nothing
-    in the log said whether the box was thrashing, whether mspdbsrv had wedged, or
-    whether ccache was doing anything - the runner is a disposable VM, so there was no
-    way to look afterwards either.
+    The build phase gets a 300 minute budget, so a single stall - or a round that cannot
+    leave anything behind - can eat the whole thing. Neither is hypothetical: a round sat
+    for a long time with the ninja counter frozen (the last log line was an ACTION that had
+    already finished), and every round before the ccache wiring was fixed compiled for
+    hours into a cache that was never called. The runner is a disposable VM, so there was
+    no way to look afterwards either.
 
     This watchdog runs next to the build (started by the workflow step, which also
-    collects its output file), writes one line every few minutes into the same stdout,
-    and never touches the build itself. Each line answers the questions that were
-    unanswerable last time: which ninja target finished last, how long the log has been
-    silent, how much RAM is left, how many compilers are running and how big they are,
-    and what ccache thinks it has done.
+    collects its output file) and writes one line every few minutes into the same stdout.
+    Each line answers the questions that were unanswerable last time: which ninja target
+    finished last, how long the log has been silent, how much RAM is left, how many
+    compilers are running and how big they are, what ccache thinks it has done, and -
+    the decisive one - whether the wrapper is present in the ninja rules GN generated
+    (read straight from src/core, so it does not depend on a CMake target name).
 
-    It deliberately does not kill anything. Its one side effect is a sentinel file
-    (ccache-not-bound.txt) when compiles are clearly happening but ccache reports zero
-    cacheable calls: build.cmd reads that sentinel and records the round as failed
-    instead of as a time-out, so a dead cache cannot re-dispatch itself forever.
+    Two side effects, both aimed at not wasting a round on something already known:
+
+      * a sentinel file (ccache-not-bound.txt) when compiles are clearly happening and
+        ccache reports zero calls. build.cmd reads it and records the round as failed
+        instead of as a time-out, so a dead cache cannot re-dispatch itself forever;
+      * with -AbortOnDeadCache, and only when the generated rules provably do NOT mention
+        the wrapper AND the projected total build time exceeds the budget, it stops the
+        compiler processes: such a round can neither finish nor leave a cache entry, so
+        ending it in minutes is strictly better than ending it in five hours. A bound
+        cache shows up in the stats within seconds of the first compile, and the missing
+        wrapper is read from the generated rules, so the two signals cannot both be
+        wrong about a working cache.
 
 .PARAMETER LogFile
     The build log being written by the workflow step (Tee-Object target).
@@ -35,6 +44,17 @@
 .PARAMETER WorkRoot
     Directory the sentinel file is written to (WORK_ROOT of build.cmd).
 
+.PARAMETER BuildDir
+    CMake build directory (BUILD_DIR of build.cmd). When given, the watchdog reads the
+    generated ninja rules under src/core and reports whether the wrapper is in them.
+
+.PARAMETER Wrapper
+    Wrapper name to look for in the generated rules.
+
+.PARAMETER BudgetMinutes
+    The build step's time budget. Used only to decide whether a dead-cache round could
+    still have finished (projected total = elapsed / progress * total).
+
 .PARAMETER IntervalSeconds
     How often to print a line.
 
@@ -42,7 +62,7 @@
     Log silence above this many minutes is reported as a stall.
 
 .PARAMETER BindingGraceMinutes
-    After this many minutes, a cache that has never seen a call is reported as broken.
+    How long a cache may legitimately show no calls before "zero calls" means broken.
 #>
 
 [CmdletBinding()]
@@ -53,9 +73,13 @@ param(
     [string]$OutFile = '',
     [string]$CcacheExe = '',
     [string]$WorkRoot = '',
+    [string]$BuildDir = '',
+    [string]$Wrapper = 'ccache',
+    [int]$BudgetMinutes = 0,
     [int]$IntervalSeconds = 300,
     [int]$StallMinutes = 20,
-    [int]$BindingGraceMinutes = 25
+    [int]$BindingGraceMinutes = 25,
+    [switch]$AbortOnDeadCache
 )
 
 $ErrorActionPreference = 'Continue'
@@ -63,6 +87,11 @@ $start = Get-Date
 $sentinel = if ($WorkRoot) { Join-Path $WorkRoot 'ccache-not-bound.txt' } else { '' }
 $sentinelWritten = $false
 $lastSignature = ''
+$lastWrapperReport = ''
+$wrapperMissing = $false
+$wrapperBound = $false
+$reportedNoCalls = $false
+$aborted = $false
 
 function Write-Watch {
     param([string]$Text)
@@ -73,12 +102,13 @@ function Write-Watch {
     }
 }
 
-Write-Watch ("start pid=$PID log=$LogFile every ${IntervalSeconds}s stall>=${StallMinutes}min")
+Write-Watch ("start pid=$PID log=$LogFile every ${IntervalSeconds}s stall>=${StallMinutes}min budget=${BudgetMinutes}min abort=$($AbortOnDeadCache.IsPresent)")
 
 while ($true) {
     try {
         $progress = 'n/a'
         $progressNum = -1
+        $totalEdges = -1
         $idleMin = -1.0
         $lastLine = ''
 
@@ -89,7 +119,11 @@ while ($true) {
                 $ninjaLines = @($tail | Where-Object { $_ -match '\[\d+/\d+\]' })
                 if ($ninjaLines.Count -gt 0) {
                     $lastLine = $ninjaLines[-1].Trim()
-                    if ($lastLine -match '\[(\d+)/(\d+)\]') { $progressNum = [int]$Matches[1]; $progress = "$($Matches[1])/$($Matches[2])" }
+                    if ($lastLine -match '\[(\d+)/(\d+)\]') {
+                        $progressNum = [int]$Matches[1]
+                        $totalEdges = [int]$Matches[2]
+                        $progress = "$($Matches[1])/$($Matches[2])"
+                    }
                 }
             } catch { }
         }
@@ -135,26 +169,79 @@ while ($true) {
             } catch { $ccacheText = 'ccache(?)' }
         }
 
+        # wrapper 是否出现在 GN 生成的 ninja 规则里：这是「ccache 会不会被调用」的决定性证据
+        $wrapperReport = ''
+        if ($BuildDir) {
+            $core = Join-Path $BuildDir 'src/core'
+            if (Test-Path -LiteralPath $core) {
+                $ninja = @(Get-ChildItem -LiteralPath $core -Recurse -Filter '*.ninja' -File -ErrorAction SilentlyContinue)
+                if ($ninja.Count -gt 0) {
+                    $newest = ($ninja | Sort-Object LastWriteTime -Descending | Select-Object -First 1).LastWriteTime
+                    if (((Get-Date) - $newest).TotalSeconds -gt 60) {
+                        $hit = $false
+                        foreach ($f in $ninja) {
+                            if (Select-String -LiteralPath $f.FullName -Pattern $Wrapper -SimpleMatch -List -ErrorAction SilentlyContinue) { $hit = $true; break }
+                        }
+                        $wrapperMissing = -not $hit
+                        $wrapperBound = $hit
+                        $wrapperReport = if ($hit) { "wrapper=$Wrapper BOUND" } else { "wrapper=$Wrapper MISSING in $($ninja.Count) ninja file(s)" }
+                    } else {
+                        $wrapperReport = 'wrapper check waits for gn to finish writing'
+                    }
+                }
+            }
+        }
+
         $signature = "$progress|$lastLine"
         $changed = if ($signature -ne $lastSignature) { 'new' } else { 'unchanged' }
         $lastSignature = $signature
-
         Write-Watch "progress=$progress log-idle=${idleMin}min free-ram=${freeRam}GB $clText $otherText $ccacheText [$changed]"
         if ($lastLine) { Write-Watch "  last: $lastLine" }
+        if ($wrapperReport -and $wrapperReport -ne $lastWrapperReport) {
+            Write-Watch "  $wrapperReport"
+            $lastWrapperReport = $wrapperReport
+        }
 
         if ($idleMin -ge $StallMinutes -and $progressNum -gt 0) {
-            Write-Watch "STALLED: no ninja line for ${idleMin}min at $progress - if this keeps up the round is lost; check cl/mspdbsrv memory above and the free RAM"
+            Write-Watch "STALLED: no ninja line for ${idleMin}min at $progress - if this keeps up the round is lost; check the free RAM and cl/mspdbsrv above"
         }
 
         $elapsedMin = ((Get-Date) - $start).TotalMinutes
-        if ($cacheable -eq 0 -and $progressNum -gt 300 -and $elapsedMin -gt $BindingGraceMinutes) {
-            Write-Watch "ERROR: ccache has never been called after $([math]::Round($elapsedMin))min and $progressNum targets - the wrapper is not bound; this round cannot carry anything into the next one"
+
+        # 「编译在进行、ccache 却一次没被调用」= 这一轮留不下任何缓存
+        $noCacheCalls = ($cacheable -eq 0 -and $progressNum -gt 200 -and $elapsedMin -gt $BindingGraceMinutes)
+        if ($noCacheCalls) {
+            $why = if ($wrapperMissing) { "the generated rules do not mention $Wrapper" }
+                   elseif ($wrapperBound) { "the rules do mention $Wrapper, so it is invoked but counts nothing cacheable" }
+                   else { 'binding unknown' }
+            if (-not $reportedNoCalls) {
+                Write-Watch "ERROR: ccache reported no calls after $([math]::Round($elapsedMin))min and $progressNum targets - $why"
+            }
+            $reportedNoCalls = $true
             if ($sentinel -and -not $sentinelWritten) {
                 try {
-                    Set-Content -LiteralPath $sentinel -Value "ccache was never called (progress=$progress)" -Encoding ascii -ErrorAction Stop
+                    Set-Content -LiteralPath $sentinel -Value "ccache was never called (progress=$progress, $wrapperReport)" -Encoding ascii -ErrorAction Stop
                     $sentinelWritten = $true
-                    Write-Watch "wrote sentinel $sentinel"
+                    Write-Watch "wrote sentinel $sentinel (build.cmd turns this round into 'failed')"
                 } catch { }
+            }
+        }
+
+        # 只有「缓存肯定不会有」且「这一轮按当前速率也编不完」时才停手：否则继续跑还有意义
+        if ($noCacheCalls -and $wrapperMissing -and $AbortOnDeadCache -and -not $aborted) {
+            if ($BudgetMinutes -gt 0 -and $progressNum -gt 0 -and $totalEdges -gt 0) {
+                $projected = $elapsedMin * ($totalEdges / $progressNum)
+                if ($projected -gt $BudgetMinutes) {
+                    $aborted = $true
+                    Write-Watch ("ABORT: dead cache (rules have no $Wrapper) and projected total {0:N0}min > budget {1}min - stopping the compilers, build.cmd will record this round as failed" -f $projected, $BudgetMinutes)
+                    foreach ($n in @('ninja', 'cl', 'ccache', 'link', 'mspdbsrv')) {
+                        try { Get-Process -Name $n -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue } catch { }
+                    }
+                } else {
+                    Write-Watch ("dead cache, but projected total {0:N0}min fits the {1}min budget - letting it run" -f $projected, $BudgetMinutes)
+                }
+            } else {
+                Write-Watch 'dead cache, but no budget/progress to project from - not aborting'
             }
         }
     } catch {
