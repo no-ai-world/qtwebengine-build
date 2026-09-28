@@ -122,6 +122,15 @@ if (Test-Path -LiteralPath $resSrc) {
         Copy-Item -LiteralPath $_.FullName -Destination (Join-Path $resDst $_.Name) -Force
         $copied += (Join-Path $resDst $_.Name)
     }
+    # 语言包在不同 Qt 版本里放的位置不同：可能是 resources/locales/，也可能是
+    # resources/qtwebengine_locales/（实测 PySide6 6.11 连 resources/locales 都没有，
+    # 语言包在 translations/qtwebengine_locales/）。上面只拷文件，会漏掉这些目录，
+    # 于是产物缺翻译（不影响编解码，但产物就不完整了）。这里把名字里带 locales 的目录补上。
+    Get-ChildItem -LiteralPath $resSrc -Directory -ErrorAction SilentlyContinue |
+        Where-Object { $_.Name -like '*locales*' } | ForEach-Object {
+            Copy-Item -LiteralPath $_.FullName -Destination (Join-Path $resDst $_.Name) -Recurse -Force
+            $copied += (Join-Path $resDst $_.Name)
+        }
     $locSrc = Join-Path $resSrc 'locales'
     if (Test-Path -LiteralPath $locSrc) {
         $locDst = Join-Path $resDst 'locales'
