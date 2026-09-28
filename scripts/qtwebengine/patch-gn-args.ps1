@@ -1,20 +1,29 @@
-﻿# 往 QtWebEngine 的 Chromium 构建里注入 gn 参数（当前只注入 cc_wrapper）。
+# 往 QtWebEngine 的 Chromium 构建里注入 gn 参数：symbol_level，以及（可选）cc_wrapper。
 #
 # 为什么需要它：QtWebEngine 的 src/core/CMakeLists.txt 自己拼 gnArgs（gnArgArg），
 # 没有给外部留「额外 gn 参数」的通道，所以只能改这处 CMakeLists。改动是加一段带标记的
 # list(APPEND gnArgArg ...)，可重复执行（先删旧块再插新块）。
 #
-# 为什么 cc_wrapper 在 Windows 上也成立（这一条是查过源码的，不是想当然）：
+# 关于 cc_wrapper：光有这个文件不够。这里原来断言「Windows 上 Chromium 用自带 clang-cl、
+# is_clang 为真」——实测是错的：构建日志里的 args.gn 明确写着 is_clang=false、is_msvc=true
+# （Qt 的 MSVC 版 QtWebEngine 就是这么配的），而
 #   chromium/build/toolchain/win/toolchain.gni 里
 #       } else if (toolchain_cc_wrapper != "" && toolchain_is_clang) {
 #         cl_prefix = toolchain_cc_wrapper + " "
-#   Windows 上 Chromium 用自带的 clang-cl（toolchain_is_clang 为真），而 Qt 没有任何地方
-#   把 is_clang 关掉，所以 cc_wrapper="ccache" 会被拼成 `ccache <clang-cl.exe> ...`。
-#   ccache 官方把 MSVC 列为 A 级、clang-cl 列为 B 级支持。
-#   cc_wrapper.gni 里那句 "Probably doesn't work on windows" 是陈述句已过时，
-#   真正决定行为的是上面那段 toolchain.gni。
+# 只在 toolchain_is_clang 为真时才把 cc_wrapper 拼到 cl.exe 前面。于是 args.gn 里的
+# cc_wrapper="ccache" 被整体丢掉：实测编到 [8038/29705]，ccache 目录 391 字节、
+# `ccache --show-stats` 里连 Cacheable calls 都没有——一次都没被调用。
+# patch-msvc-ccache.ps1 补上那一处条件（ccache 官方把 MSVC 列为 A 级支持）。
 #   代价：设了 cc_wrapper 后 show_includes 会从 /showIncludes:user 退回 /showIncludes
 #   （源码里有注释说明，是绕 sccache 的老问题），.ninja_deps 变大、依赖解析变慢一点。
+#   好在 /showIncludes:user 的条件同样要求 toolchain_is_clang，所以 MSVC 分支本来就用
+#   完整的 /showIncludes，ccache 解析依赖不受影响。
+#
+# 关于 symbol_level：Qt 在 RelWithDebInfo + MSVC 下自己写 symbol_level=2
+# （cmake/Functions.cmake：WIN32 AND NOT CLANG -> symbol_level=2），也就是每个 obj 都
+# 走 /Zi + mspdbsrv 写 PDB：更慢、更占内存，而且 PDB 服务一旦卡住所有 cl.exe 一起堵死
+# （正是「日志几十分钟一行不出」那种症状的候选原因之一）。产物只当运行时用，不需要调试
+# 信息，所以这里注入 symbol_level=0；要调试信息就用 -SymbolLevel 2。
 #
 # 幂等与可断言：注入后断言 list(APPEND gnArgArg 的出现次数正好 +1；不带任何开关调用则只清除注入块。
 
@@ -23,8 +32,12 @@ param(
     [Parameter(Mandatory = $true)]
     [string]$SourceRoot,
 
-    # 注入 cc_wrapper="ccache"（要求 ccache.exe 在构建进程的 PATH 上）
+    # 注入 cc_wrapper="ccache"（要求 ccache.exe 在构建进程的 PATH 上；另外还需要
+    # patch-msvc-ccache.ps1 放行 MSVC 工具链，否则这个参数会被 Chromium 忽略）
     [switch]$UseCcache,
+
+    # 注入 symbol_level=<N>；留空表示不注入（Qt 自己在 RelWithDebInfo+MSVC 下写 2）
+    [string]$SymbolLevel = '',
 
     [string]$RelativeFile = 'src/core/CMakeLists.txt',
 
@@ -65,6 +78,9 @@ foreach ($line in $lines) {
 
 # 组装本次要注入的内容
 $inject = New-Object System.Collections.Generic.List[string]
+if ($SymbolLevel -ne '') {
+    $inject.Add("        symbol_level=$SymbolLevel")
+}
 if ($UseCcache) {
     $inject.Add('        cc_wrapper="ccache"')
 }

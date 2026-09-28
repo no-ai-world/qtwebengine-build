@@ -112,9 +112,13 @@ on:
         type: number
         default: 300
       jumbo:
-        description: '启用 jumbo build（合并翻译单元，编译更快，但每单元更吃内存）'
-        type: boolean
-        default: false
+        description: 'jumbo build。留空 = Qt 自己的默认（开，每个 TU 合并 8 个源文件）；0/off/false = -no-webengine-jumbo-build，每源文件一个 TU（最省内存、总工作量最大）；数字 N = -webengine-jumbo-build=N，每个 TU 合并 N 个源（N 越小峰值内存越小、TU 越多）。旧的布尔 false 从来没有关掉过 jumbo：Qt 的 configure 默认就是开、merge limit 8'
+        type: string
+        default: ''
+      symbol_level:
+        description: 'gn symbol_level。默认 0 = 不要调试信息：编译更快、内存与磁盘小得多，而且不经过 mspdbsrv（PDB 服务卡住会让所有 cl.exe 一起堵死）。2 = Qt 在 RelWithDebInfo+MSVC 下的原值（每个 obj 都写 PDB，慢且大）'
+        type: string
+        default: '0'
       parallel:
         description: '并行度（留空 = 按 CPU 与内存自动换算）'
         type: string
@@ -172,7 +176,10 @@ env:
   SHALLOW_SUBMODULE: ${{ inputs.shallow_submodule && '1' || '0' }}
   SKIP_PATCH: ${{ inputs.skip_patch && '1' || '0' }}
   USE_CCACHE: ${{ inputs.use_ccache && '1' || '0' }}
-  JUMBO: ${{ inputs.jumbo && '1' || '0' }}
+  # 原样传给 build.cmd（它自己认 0/off/on/N）。原来的 && '1' || '0' 把空字符串、"on"、
+  # "4" 全压成同一个值，这个开关实际上从来没有起过作用。
+  JUMBO: ${{ inputs.jumbo }}
+  SYMBOL_LEVEL: ${{ inputs.symbol_level }}
   PARALLEL: ${{ inputs.parallel }}
   MIN_FREE_GB: ${{ inputs.min_free_gb }}
   PAGEFILE_GB: ${{ inputs.pagefile_gb }}
@@ -270,7 +277,8 @@ jobs:
           # 布尔输入归一化后到底是什么，直接摊在日志里：workflow_dispatch 的输入经
           # 表达式上下文转手后类型未必如声明（number 就实测变成了字符串），
           # skip_patch / skip_preflight 读错一个，整轮的方向就跑偏了。
-          Write-Host ("布尔输入: SKIP_PREFLIGHT={0} SKIP_PATCH={1} USE_CCACHE={2} JUMBO={3} SHALLOW_SUBMODULE={4}" -f $env:SKIP_PREFLIGHT, $env:SKIP_PATCH, $env:USE_CCACHE, $env:JUMBO, $env:SHALLOW_SUBMODULE)
+          Write-Host ("布尔输入: SKIP_PREFLIGHT={0} SKIP_PATCH={1} USE_CCACHE={2} SHALLOW_SUBMODULE={3}" -f $env:SKIP_PREFLIGHT, $env:SKIP_PATCH, $env:USE_CCACHE, $env:SHALLOW_SUBMODULE)
+          Write-Host ("构建开关: JUMBO={0} SYMBOL_LEVEL={1} PARALLEL_INPUT={2}" -f $env:JUMBO, $env:SYMBOL_LEVEL, $env:PARALLEL)
 
       - name: 扩大页面文件（给链接兜底）
         shell: pwsh
@@ -406,8 +414,33 @@ jobs:
           $log = Join-Path $env:DIST_DIR "build-round${{ inputs.round }}.log"
           $script = Join-Path $env:GITHUB_WORKSPACE 'scripts\qtwebengine\build.cmd'
           Write-Host "日志：$log"
-          & cmd.exe /c "`"$script`" build 2>&1" | Tee-Object -FilePath $log
-          Write-Host "构建阶段退出码：$LASTEXITCODE"
+          # 看门狗：这一阶段有 5 小时预算，一次卡死就能吃掉整轮，而 runner 是一次性 VM，
+          # 事后无从查证（上一轮就是这样：ninja 计数停在 17012，日志里没有任何线索）。
+          # 它每 5 分钟往同一份标准输出写一行：最后完成的目标、日志静默时长、可用内存、
+          # cl/mspdbsrv 的进程数与占用、ccache 计数；同时另存一份 watch-roundN.log 进产物。
+          # 它只观察，不杀构建。
+          $watchScript = Join-Path $env:GITHUB_WORKSPACE 'scripts\qtwebengine\watch-build.ps1'
+          $watchOut = Join-Path $env:DIST_DIR "watch-round${{ inputs.round }}.log"
+          $watch = $null
+          if (Test-Path $watchScript) {
+            $watchArgs = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $watchScript,
+                           '-LogFile', $log, '-OutFile', $watchOut, '-WorkRoot', $env:WORK_ROOT)
+            $ccacheExe = Join-Path $env:TOOLS_BIN 'ccache.exe'
+            if (Test-Path $ccacheExe) { $watchArgs += @('-CcacheExe', $ccacheExe) }
+            $watch = Start-Process -FilePath 'pwsh' -ArgumentList $watchArgs -NoNewWindow -PassThru
+            Write-Host "看门狗 pid=$($watch.Id)，输出：$watchOut"
+          } else {
+            Write-Host '没有 watch-build.ps1，跳看看门狗'
+          }
+          try {
+            & cmd.exe /c "`"$script`" build 2>&1" | Tee-Object -FilePath $log
+            Write-Host "构建阶段退出码：$LASTEXITCODE"
+          } finally {
+            if ($watch -and -not $watch.HasExited) {
+              Stop-Process -Id $watch.Id -Force -ErrorAction SilentlyContinue
+              Write-Host '看门狗已停止'
+            }
+          }
 
       - name: ccache 是否真的生效（对照 gn cc_wrapper 注入）
         id: ccachecheck
@@ -431,7 +464,7 @@ jobs:
           Write-Host "ccache: $cacheable"
           if ($cacheable -and $cacheable -match ':\s*(\d+)') {
             if ([int]$Matches[1] -eq 0) {
-              throw 'ccache 一次都没被调用：gn cc_wrapper 没生效，下一轮不会有任何进展。检查 scripts/qtwebengine/patch-gn-args.ps1 的注入结果与 configure 日志。'
+              throw 'ccache 一次都没被调用：cc_wrapper 没绑定，下一轮不会有任何进展。先看 build 日志开头的 [ccache-bound] 与 [watch] 行，再检查 scripts/qtwebengine/patch-msvc-ccache.ps1（MSVC 工具链只对 clang 拼 cc_wrapper）与 patch-gn-args.ps1（args.gn 注入）。'
             }
           } else {
             Write-Warning '没解析到 Cacheable calls，按 stats 输出人工核对'
@@ -460,7 +493,11 @@ jobs:
           if ($result -eq 'failed') {
             Write-Host '编译报错或没进到编译，本轮不会排下一轮——先在日志里把报错修掉。'
           } elseif ($result -eq 'killed') {
-            Write-Host '被时间预算打断：源码与中间产物丢弃，ccache 已积累本轮编完的目标，下一轮接着编。'
+            if ($env:USE_CCACHE -eq '1') {
+              Write-Host '被时间预算打断：构建目录随 runner 丢弃，但本轮编完的目标已进 ccache（是否真的进了，看 ccache 一步的统计）；下一轮用这份缓存接着编。'
+            } else {
+              Write-Host '被时间预算打断：USE_CCACHE=0，本轮没有任何编译器缓存，下一轮等于从头再来。'
+            }
           }
 
       - name: 收尾阶段（安装 + 打包）
@@ -644,7 +681,8 @@ jobs:
             -f ccache_version='${{ inputs.ccache_version }}' `
             -f build_budget_minutes='${{ inputs.build_budget_minutes }}' `
             -f use_ccache=${{ inputs.use_ccache }} `
-            -f jumbo=${{ inputs.jumbo }} `
+            -f jumbo='${{ inputs.jumbo }}' `
+            -f symbol_level='${{ inputs.symbol_level }}' `
             -f parallel='${{ inputs.parallel }}' `
             -f shallow_submodule=${{ inputs.shallow_submodule }} `
             -f skip_patch=${{ inputs.skip_patch }} `

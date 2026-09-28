@@ -52,13 +52,33 @@ rem                     build for hours and then fail at the install step. Of th
 rem                     only RelWithDebInfo produces unsuffixed DLL names that can be
 rem                     laid over a PySide6 wheel; Debug appends the debug postfix;
 rem   PARALLEL          default empty = all cores; CI passes a RAM-aware value
-rem   USE_CCACHE        default 1 = inject gn cc_wrapper="ccache"
+rem   USE_CCACHE        default 1 = inject gn cc_wrapper="ccache" AND patch Chromium's
+rem                     Windows toolchain so the wrapper reaches the MSVC compiler too.
+rem                     Without that second patch the injected cc_wrapper is silently
+rem                     dropped: win/toolchain.gni only fills cl_prefix when the toolchain
+rem                     is clang, and Qt's MSVC build has is_clang=false. Measured with the
+rem                     patch missing: [8038/29705] targets compiled, a 391-byte cache and
+rem                     no "Cacheable calls" at all.
 rem   CCACHE_DIR        default %WORK_ROOT%\ccache   (ccache.conf is written here)
 rem   CCACHE_MAX_SIZE   default 20G
-rem   JUMBO             default 0 = pass -webengine-jumbo-build to configure
+rem   JUMBO             default empty = Qt's own default (jumbo ON, merge limit 8).
+rem                     0/off/false = -no-webengine-jumbo-build: one source per unit, least
+rem                     memory per compiler, most total work. A number N = jumbo with N
+rem                     sources per unit (smaller N, smaller peak memory, more units).
+rem                     The old boolean was a trap - "0" never turned jumbo off, it only
+rem                     omitted -webengine-jumbo-build while Qt's configure default is
+rem                     limit=8, i.e. ON.
+rem   SYMBOL_LEVEL      default 0 = inject symbol_level=0 (Qt writes 2 for RelWithDebInfo +
+rem                     MSVC: /Zi and a PDB per object through mspdbsrv - slower, much
+rem                     bigger, and a wedged PDB server blocks every cl.exe at once).
+rem                     Set 2 to get the debug information back.
+rem   NINJA_JOBS        default %PARALLEL% when set = -j for the inner Chromium ninja,
+rem                     exported as NINJAFLAGS. QtWebEngine reads $ENV{NINJAFLAGS} while it
+rem                     GENERATES the ninja command, otherwise ninja's own default (cores+2)
+rem                     applies: 6 concurrent MSVC compiles on the 4-core runner.
 rem   RESET             1/true = delete source/build/install dirs first
 rem   SHALLOW_SUBMODULE default 1/true = shallow Chromium submodule
-rem   SKIP_PATCH        1/true = skip both patches
+rem   SKIP_PATCH        1/true = skip all patches (including the ccache one)
 rem
 rem Exit codes: 1 env/args, 2 source or submodule, 3 patch, 4 configure, 5 build,
 rem             6 install, 7 package
@@ -157,6 +177,9 @@ call :patch
 if errorlevel 1 exit /b 3
 call :configure
 if errorlevel 1 exit /b 4
+rem Prove in minutes, not after five hours, that ccache really reaches the compiler.
+call :assert_ccache_bound
+if errorlevel 1 exit /b 4
 exit /b 0
 
 rem ---------------------------------------------------------------------------
@@ -240,9 +263,26 @@ rem Booleans accept both 1/0 and true/false; CI boolean inputs arrive as true/fa
 if /i "%USE_CCACHE%"=="true" set "USE_CCACHE=1"
 if /i "%USE_CCACHE%"=="false" set "USE_CCACHE=0"
 if not defined USE_CCACHE set "USE_CCACHE=1"
-if /i "%JUMBO%"=="true" set "JUMBO=1"
-if /i "%JUMBO%"=="false" set "JUMBO=0"
-if not defined JUMBO set "JUMBO=0"
+rem JUMBO is deliberately not coerced to 0/1 any more: Qt's configure default IS
+rem jumbo with a merge limit of 8, so "no flag" and "-webengine-jumbo-build" mean the
+rem same thing, and the old "JUMBO=0 turns jumbo off" reading (also printed by the
+rem workflow input description) was simply wrong. Normalise the words here, :configure
+rem turns the value into the right configure flag.
+if /i "%JUMBO%"=="yes" set "JUMBO=on"
+if /i "%JUMBO%"=="true" set "JUMBO=on"
+if /i "%JUMBO%"=="1" set "JUMBO=on"
+if /i "%JUMBO%"=="no" set "JUMBO=off"
+if /i "%JUMBO%"=="false" set "JUMBO=off"
+if /i "%JUMBO%"=="0" set "JUMBO=off"
+rem Qt asks GN for symbol_level=2 in RelWithDebInfo on MSVC (cmake/Functions.cmake),
+rem which means /Zi plus a PDB written through mspdbsrv for every object. The artifact
+rem is consumed as a runtime, so default to 0: faster, far smaller, and it takes the
+rem PDB server out of the picture.
+if not defined SYMBOL_LEVEL set "SYMBOL_LEVEL=0"
+rem Read by QtWebEngine while it GENERATES the ninja command (cmake/Functions.cmake:
+rem string(REPLACE " " ";" NINJAFLAGS "$ENV{NINJAFLAGS}")), so it has to be set before
+rem configure. Unset PARALLEL (local runs) leaves ninja's own cores+2 default alone.
+if not defined NINJA_JOBS if defined PARALLEL set "NINJA_JOBS=%PARALLEL%"
 if /i "%SHALLOW_SUBMODULE%"=="true" set "SHALLOW_SUBMODULE=1"
 if /i "%SHALLOW_SUBMODULE%"=="false" set "SHALLOW_SUBMODULE=0"
 if not defined SHALLOW_SUBMODULE set "SHALLOW_SUBMODULE=1"
@@ -274,7 +314,22 @@ if not defined QT_PRIV (
 )
 echo [env] Qt prefix      : %QT_PATH%
 echo [env] build type     : %BUILD_TYPE%   parallel: %PARALLEL%
+set "JUMBO_ECHO=%JUMBO%"
+if not defined JUMBO_ECHO set "JUMBO_ECHO=Qt default - jumbo ON with merge limit 8"
+rem ninja's own default is cores+2 jobs. On the 4-core / 16 GB runner that is 6
+rem concurrent MSVC compiles and far more memory than the box has once jumbo
+rem translation units are in flight, so the ceiling is pinned to the same RAM-aware
+rem number the outer build gets (PARALLEL) instead of being left to chance.
+set "NINJA_JOBS_ECHO=%NINJA_JOBS%"
+if defined NINJA_JOBS (
+    set "NINJAFLAGS=-j%NINJA_JOBS%"
+) else (
+    set "NINJA_JOBS_ECHO=ninja default - cores+2"
+)
 echo [env] ccache         : use=%USE_CCACHE% dir=%CCACHE_DIR%
+echo [env] jumbo          : %JUMBO_ECHO%
+echo [env] symbol_level   : %SYMBOL_LEVEL%
+echo [env] ninja jobs     : %NINJA_JOBS_ECHO%
 echo [env] source / build : %SRC_DIR% / %BUILD_DIR%
 exit /b 0
 
@@ -488,28 +543,40 @@ if "%SKIP_PATCH%"=="1" (
     echo [step] SKIP_PATCH=1: skipping patches
     exit /b 0
 )
-echo [step] patch 1/3: Chromium cppgc - MSVC 14.44 reports C2352 on Qt 6.8.3 V8
+echo [step] patch 1/4: Chromium cppgc - MSVC 14.44 reports C2352 on Qt 6.8.3 V8
 call :run_ps patch-cppgc.ps1 -SourceRoot "%SRC_DIR%"
 if errorlevel 1 (
     echo [error] cppgc patch failed
     exit /b 1
 )
-echo [step] patch 2/3: single configuration - the VS generator would build RelWithDebInfo and Debug
+echo [step] patch 2/4: single configuration - the VS generator would build RelWithDebInfo and Debug
 call :run_ps patch-single-config.ps1 -SourceRoot "%SRC_DIR%"
 if errorlevel 1 (
     echo [error] single-config patch failed
     exit /b 1
 )
 if "%USE_CCACHE%"=="1" (
-    echo [step] patch 3/3: gn cc_wrapper=ccache into src/core/CMakeLists.txt
-    call :run_ps patch-gn-args.ps1 -SourceRoot "%SRC_DIR%" -UseCcache
+    echo [step] patch 3/4: gn symbol_level=%SYMBOL_LEVEL% and cc_wrapper=ccache into src/core/CMakeLists.txt
+    call :run_ps patch-gn-args.ps1 -SourceRoot "%SRC_DIR%" -SymbolLevel "%SYMBOL_LEVEL%" -UseCcache
 ) else (
-    echo [step] patch 3/3: clearing previously injected gn args
-    call :run_ps patch-gn-args.ps1 -SourceRoot "%SRC_DIR%"
+    echo [step] patch 3/4: gn symbol_level=%SYMBOL_LEVEL%, clearing any injected cc_wrapper
+    call :run_ps patch-gn-args.ps1 -SourceRoot "%SRC_DIR%" -SymbolLevel "%SYMBOL_LEVEL%"
 )
 if errorlevel 1 (
     echo [error] gn args patch failed
     exit /b 1
+)
+rem The toolchain patch is what makes ccache actually run: Chromium only wires
+rem cc_wrapper for clang toolchains (win/toolchain.gni), and Qt's MSVC build has
+rem is_clang=false. It is inert when USE_CCACHE=0, because nothing injects cc_wrapper
+rem then, so leaving it applied across phases is harmless.
+if "%USE_CCACHE%"=="1" (
+    echo [step] patch 4/4: MSVC toolchain honours cc_wrapper - Chromium only wires it for clang
+    call :run_ps patch-msvc-ccache.ps1 -SourceRoot "%SRC_DIR%"
+    if errorlevel 1 (
+        echo [error] MSVC cc_wrapper patch failed; the cache would never be called
+        exit /b 1
+    )
 )
 exit /b 0
 
@@ -525,8 +592,18 @@ exit /b 0
 
 :configure_run
 mkdir "%BUILD_DIR%" 2>nul
+rem QtWebEngine's configure takes -webengine-jumbo-build=(on|off|N): off turns the
+rem feature off, N sets jumbo_file_merge_limit (how many sources go into one
+rem translation unit). Smaller N means smaller peak memory per compiler and more
+rem translation units to compile.
 set "JUMBO_FLAG="
-if "%JUMBO%"=="1" set "JUMBO_FLAG=-webengine-jumbo-build"
+if /i "%JUMBO%"=="off" set "JUMBO_FLAG=-no-webengine-jumbo-build"
+if /i "%JUMBO%"=="on" set "JUMBO_FLAG=-webengine-jumbo-build"
+set "JUMBO_NONNUM="
+for /f "delims=0123456789" %%a in ("%JUMBO%") do set "JUMBO_NONNUM=%%a"
+if not defined JUMBO_NONNUM if defined JUMBO set "JUMBO_FLAG=-webengine-jumbo-build=%JUMBO%"
+set "JUMBO_NONNUM="
+if defined JUMBO_FLAG echo [step] jumbo        : %JUMBO_FLAG%
 pushd "%BUILD_DIR%"
 echo [step] qt-configure-module -webengine-proprietary-codecs; it downloads the Chromium toolchain
 rem No -nomake examples/-nomake tests here: those belong to the top-level Qt configure
@@ -635,6 +712,32 @@ echo [error] cannot determine the configuration of "%BUILD_DIR%\CMakeCache.txt"
 echo [error] CMAKE_CONFIGURATION_TYPES is absent and CMAKE_BUILD_TYPE is not %BUILD_TYPE%
 exit /b 1
 
+:assert_ccache_bound
+rem The build phase costs five hours; a cache that never binds throws all of them away,
+rem and that is not hypothetical: with cc_wrapper injected but dropped by the MSVC
+rem toolchain, a round compiled [8038/29705] targets into a 391-byte cache and
+rem `ccache --show-stats` never saw a single call. check-ccache-bound.ps1 runs the GN
+rem generation (about four minutes - the build phase then finds it up to date) and
+rem reads the ninja rules GN wrote: they must name the wrapper. Exit code 2 from the
+rem script means "could not generate / could not tell", which is only a warning: the
+rem end-of-round ccache check and the build-step watcher still cover that case.
+if not "%USE_CCACHE%"=="1" exit /b 0
+if "%SKIP_PATCH%"=="1" (
+    echo [warn] SKIP_PATCH=1: cannot verify that cc_wrapper reached the MSVC toolchain
+    exit /b 0
+)
+call :run_ps check-ccache-bound.ps1 -BuildDir "%BUILD_DIR%" -BuildType "%BUILD_TYPE%" -Wrapper "ccache"
+set "RC=%errorlevel%"
+if "%RC%"=="0" exit /b 0
+if "%RC%"=="2" (
+    echo [warn] could not verify the ccache binding before the build; see the log above
+    exit /b 0
+)
+echo [error] cc_wrapper did not reach the compiler command line in the generated ninja rules
+echo [error] ccache would never be called and the whole build would be thrown away
+echo [error] check patch-msvc-ccache.ps1 and patch-gn-args.ps1 against this source tree
+exit /b 1
+
 :build
 pushd "%BUILD_DIR%"
 rem --config is mandatory here. This tree uses the Visual Studio generator, and for a
@@ -659,6 +762,17 @@ rem leave STATE_FILE absent, which is what the caller reads as "killed, resume l
 rem A genuine compile error arrives here as ninja's small positive exit code via cmake,
 rem never as this one, so this cannot mask a real failure.
 if "%RC%"=="-1073741510" (
+    rem A budget kill is only worth resuming when the next round has something to resume
+    rem from. The build-step watcher drops a sentinel when compiles were clearly
+    rem happening and ccache still reported zero calls: then this round is a
+    rem deterministic failure, not a time-out, and re-dispatching would burn another
+    rem full budget on exactly the same nothing.
+    if exist "%WORK_ROOT%\ccache-not-bound.txt" (
+        > "%STATE_FILE%" echo failed ccache-not-bound
+        echo [error] killed by the time budget, but ccache was never called this round
+        echo [error] state file says failed, so no next round is queued
+        exit /b 1
+    )
     echo [step] interrupted by the step time budget; state file left absent so the next round resumes
     exit /b 5
 )

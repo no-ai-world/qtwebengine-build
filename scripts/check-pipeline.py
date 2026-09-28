@@ -316,6 +316,85 @@ def check_workflow(root: Path) -> None:
             fail("workflow/yaml", f"does not parse: {exc}")
 
 
+# ---------------------------------------------------------------------------
+# ccache 接线：一个永远不会被调用的缓存比没有缓存更糟——它把「下一轮接着编」
+# 悄悄变成「下一轮从头再来」，而一轮就是五个小时
+# ---------------------------------------------------------------------------
+
+PATCH_MSVC_CCACHE = "scripts/qtwebengine/patch-msvc-ccache.ps1"
+CHECK_CCACHE_BOUND = "scripts/qtwebengine/check-ccache-bound.ps1"
+WATCH_BUILD = "scripts/qtwebengine/watch-build.ps1"
+
+
+def check_ccache_wiring(root: Path) -> None:
+    build = read_text(root / BUILD_CMD)
+    workflow = read_text(root / WORKFLOW)
+
+    # 1. Chromium 只在 toolchain_is_clang 为真时才把 cc_wrapper 拼到 cl.exe 前面
+    #    （chromium/build/toolchain/win/toolchain.gni），而 Qt 的 MSVC 版 QtWebEngine
+    #    是 is_clang=false：没有这个补丁，args.gn 里的 cc_wrapper 被整体丢掉，ccache
+    #    一次都不会被调用（实测：编到 [8038/29705]，缓存 391 字节，没有 Cacheable calls）。
+    if "call :run_ps patch-msvc-ccache.ps1" not in build:
+        fail(
+            "ccache/wiring",
+            "build.cmd 没有调用 patch-msvc-ccache.ps1：MSVC 下注入的 cc_wrapper 会被忽略，"
+            "ccache 永远不会被调用",
+        )
+    patch = root / PATCH_MSVC_CCACHE
+    if not patch.is_file():
+        fail("ccache/wiring", f"缺少 {PATCH_MSVC_CCACHE}")
+    else:
+        ptext = read_text(patch)
+        needles = (
+            ('toolchain_cc_wrapper != "" && toolchain_is_clang', "要找的上游条件"),
+            ('} else if (toolchain_cc_wrapper != "") {', "要写回的新条件"),
+        )
+        for needle, why in needles:
+            if needle not in ptext:
+                fail("ccache/wiring", f"{PATCH_MSVC_CCACHE} 丢了{why}：{needle}")
+
+    # 2. 绑定关系必须在五小时的构建之前证明，而不是构建之后才知道。
+    if "call :run_ps check-ccache-bound.ps1" not in build:
+        fail(
+            "ccache/wiring",
+            "build.cmd 没有跑 check-ccache-bound.ps1：缓存没接上这件事只能在一整轮白编之后才发现",
+        )
+    if not (root / CHECK_CCACHE_BOUND).is_file():
+        fail("ccache/wiring", f"缺少 {CHECK_CCACHE_BOUND}")
+
+    # 3. 看门狗是唯一能提前看到卡死的手段（runner 是一次性 VM，事后无从查证）。
+    if "watch-build.ps1" not in workflow:
+        fail("ccache/wiring", "workflow 没有启动 watch-build.ps1：卡死之后又只能靠猜")
+    if not (root / WATCH_BUILD).is_file():
+        fail("ccache/wiring", f"缺少 {WATCH_BUILD}")
+
+    # 4. ninja 自己的默认并行度是 cores+2；在 4 核/16 GB 的 runner 上，这个数字就是
+    #    决定「换页卡死」还是「编完」的内存上限。
+    if 'set "NINJAFLAGS=-j%NINJA_JOBS%"' not in build:
+        fail(
+            "ccache/wiring",
+            "build.cmd 没有把 NINJA_JOBS 导出成 NINJAFLAGS：内层 Chromium ninja 会用 cores+2",
+        )
+    if 'if not defined NINJA_JOBS if defined PARALLEL set "NINJA_JOBS=%PARALLEL%"' not in build:
+        fail("ccache/wiring", "NINJA_JOBS 没有从 PARALLEL 取默认值")
+
+    # 5. jumbo：旧的 JUMBO=0 从来没有关掉过它（Qt 的 configure 默认就是开、merge limit 8），
+    #    真正的关开关和 limit 旋钮都必须留着。
+    if "-no-webengine-jumbo-build" not in build:
+        fail("ccache/wiring", "build.cmd 无法真正关掉 jumbo（Qt 默认是开、limit 8）")
+    if "-webengine-jumbo-build=%JUMBO%" not in build:
+        fail("ccache/wiring", "build.cmd 无法设置 jumbo 的 merge limit")
+    if "JUMBO: ${{ inputs.jumbo }}" not in workflow:
+        fail(
+            "ccache/wiring",
+            "workflow 仍然把 jumbo 输入压成 0/1（&& '1' || '0'）：这正是那个开关从未生效的原因",
+        )
+
+    # 6. symbol_level 旋钮要真的接到 build.cmd 上（Qt 在 RelWithDebInfo+MSVC 下写 2）。
+    if "SYMBOL_LEVEL:" not in workflow or "-SymbolLevel" not in build:
+        fail("ccache/wiring", "symbol_level 输入没有接到 patch-gn-args.ps1 -SymbolLevel 上")
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description="流水线静态自检（不编译、不联网）")
     ap.add_argument("--root", default=None, help="仓库根目录，默认取本脚本的上两级")
@@ -324,6 +403,7 @@ def main() -> int:
 
     check_build_cmd(root)
     check_workflow(root)
+    check_ccache_wiring(root)
 
     for n in notes:
         print(f"note: {n}")
