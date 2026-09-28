@@ -479,6 +479,23 @@ def check_literalpath_wildcards(root: Path) -> None:
                     )
 
 
+def check_tools_compile(root: Path) -> None:
+    """本地工具脚本至少要能编译：要用它的时候才发现语法坏了最亏。"""
+    import py_compile
+
+    for rel in ("scripts/check-pipeline.py", "scripts/qtwebengine/summarize-round.py", "scripts/qtwebengine/verify-codecs.py"):
+        path = root / rel
+        if not path.is_file():
+            fail("tools/compile", f"missing {rel}")
+            continue
+        try:
+            py_compile.compile(str(path), cfile=str(path) + ".pyc-check", doraise=True)
+        except py_compile.PyCompileError as exc:
+            fail("tools/compile", f"{rel}: {exc.msg}")
+        finally:
+            Path(str(path) + ".pyc-check").unlink(missing_ok=True)
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description="流水线静态自检（不编译、不联网）")
     ap.add_argument("--root", default=None, help="仓库根目录，默认取本脚本的上两级")
@@ -490,6 +507,7 @@ def main() -> int:
     check_ccache_wiring(root)
     check_run_ps_args(root)
     check_literalpath_wildcards(root)
+    check_tools_compile(root)
 
     for n in notes:
         print(f"note: {n}")

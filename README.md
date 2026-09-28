@@ -160,6 +160,16 @@ scripts\qtwebengine\build.cmd all
 python scripts/check-pipeline.py
 ```
 
+一轮跑完之后（或任何一轮的历史日志）这样读：
+
+```powershell
+python scripts/qtwebengine/summarize-round.py --run <run_id>      # 自动下载并汇总
+python scripts/qtwebengine/summarize-round.py .temp/r3.log         # 或直接读已有日志
+```
+
+它回答的正是"还能不能靠分轮续跑收口"的几个问题：编到第几个目标、最长静默多久、重活阶段还剩
+多少内存、ccache 被调用了多少次/命中多少/缓存多大、以及按当前速率投影还要多久。
+
 它盯的是那些「几分钟就能发现、却要烧掉一台 runner 和半小时到几小时才能暴露」的问题：
 批处理的 CRLF/ASCII、`goto`/`call` 标签是否存在、块括号是否配平、`cmake --build`/`--install`
 是否带了 `--config`、确定性失败有没有落盘成 `failed`（漏了就会被误判成超时并无限续跑）、
@@ -177,6 +187,7 @@ scripts/qtwebengine/
   patch-msvc-ccache.ps1                   让 cc_wrapper 对 MSVC 工具链也生效（ccache 真被调用的前提）
   check-ccache-bound.ps1                  prepare 阶段就证明缓存已接线（跑 GN 生成 + 读 ninja 规则）
   watch-build.ps1                         构建阶段看门狗（进度/静默/内存/ccache 接线 + check run 心跳）
+  summarize-round.py                      读一轮作业日志：进度/静默/内存/缓存效率/结局，压成一页
   install-webengine-runtime.ps1           把产物铺进 PySide6（版本核对、备份）
   verify-codecs.py                        编解码验收探针（退出码即结论）
   check-pipeline.py                       流水线静态自检（派 CI 之前先跑，不编译不联网）
