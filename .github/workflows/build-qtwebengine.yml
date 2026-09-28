@@ -183,7 +183,9 @@ jobs:
   build:
     name: QtWebEngine ${{ inputs.qt_version }} · round ${{ inputs.round }} · proprietary codecs
     runs-on: ${{ inputs.runner }}
-    timeout-minutes: ${{ inputs.timeout_minutes }}
+    # fromJSON 不能省：workflow_dispatch 的 number 输入经 API 派发时到达 inputs 上下文的是
+    # 字符串（实测报 "Unexpected value '360'"），而 timeout-minutes 要的是数字。
+    timeout-minutes: ${{ fromJSON(inputs.timeout_minutes) }}
     steps:
       - name: 取本仓库（构建脚本）
         uses: actions/checkout@v4
@@ -261,6 +263,10 @@ jobs:
             Write-Host ("{0,-15} = {1}" -f $kv.Key, $kv.Value)
             "$($kv.Key)=$($kv.Value)" >> $env:GITHUB_ENV
           }
+          # 布尔输入归一化后到底是什么，直接摊在日志里：workflow_dispatch 的输入经
+          # 表达式上下文转手后类型未必如声明（number 就实测变成了字符串），
+          # skip_patch / skip_preflight 读错一个，整轮的方向就跑偏了。
+          Write-Host ("布尔输入: SKIP_PREFLIGHT={0} SKIP_PATCH={1} USE_CCACHE={2} JUMBO={3} SHALLOW_SUBMODULE={4}" -f $env:SKIP_PREFLIGHT, $env:SKIP_PATCH, $env:USE_CCACHE, $env:JUMBO, $env:SHALLOW_SUBMODULE)
 
       - name: 扩大页面文件（给链接兜底）
         shell: pwsh
@@ -388,7 +394,8 @@ jobs:
 
       - name: 构建阶段（受时间预算约束，到点被打断留给下一轮）
         shell: pwsh
-        timeout-minutes: ${{ inputs.build_budget_minutes > 0 && inputs.build_budget_minutes || inputs.timeout_minutes }}
+        # 同 job 级 timeout-minutes：number 输入在此是字符串，必须 fromJSON 转成数字
+        timeout-minutes: ${{ fromJSON(inputs.build_budget_minutes) > 0 && fromJSON(inputs.build_budget_minutes) || fromJSON(inputs.timeout_minutes) }}
         continue-on-error: true
         run: |
           $log = Join-Path $env:DIST_DIR "build-round${{ inputs.round }}.log"
