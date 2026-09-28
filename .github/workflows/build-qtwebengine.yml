@@ -247,6 +247,7 @@ jobs:
             WORK_ROOT         = $workRoot
             QT_ROOT           = "$($best.Name):\Qt"
             QT_TOOLS_DIR      = "$($best.Name):\Qt\Tools"
+            TOOLS_BIN         = "$workRoot\tools\bin"
             QT_PATH           = "$($best.Name):\Qt\$env:QT_VERSION\msvc2022_64"
             SRC_DIR           = "$workRoot\src\qtwebengine"
             BUILD_DIR         = "$workRoot\build"
