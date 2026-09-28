@@ -1,0 +1,616 @@
+# ============================================================================
+# 从源码编译 QtWebEngine（Windows x64 / MSVC 2022）——开启私有编解码器（H.264/AAC/MP3），
+# 并把运行时打包成可直接铺进 PySide6 安装目录的产物。
+#
+# 参考手册（逐条对应）：https://github.com/open-prison-education/ope-lms/blob/main/WebEngineMP4Build_6.8.3.md
+# 本仓库的脚本实现：scripts/qtwebengine/build.cmd（同样的步骤，可本地跑）
+#
+# 为什么需要这条流水线
+#   Qt/PySide6 的开源二进制里 QtWebEngine 不含私有编解码器，实测
+#   MediaSource.isTypeSupported('video/mp4; codecs="avc1.42E01E"') === false，
+#   页面里的 <video> 放不了 MP4/H.264/AAC。只有用 -webengine-proprietary-codecs
+#   自建一份运行时才能改掉这一点。
+#
+# 一轮跑不完怎么续（这条是照 kiwi browser 的做法来的：ccache + 分轮 + 缓存外存）
+#   一个 6 小时的作业装不下 Chromium 级构建，但「一轮」不必等于「一次构建」：
+#     1) build.cmd 被拆成 prepare / build / finish 三个阶段，阶段之间只靠 ccache 传递进度；
+#     2) 注入 gn 参数 cc_wrapper="ccache"，让 Chromium 的编译器缓存真的生效
+#        （见 scripts/qtwebengine/patch-gn-args.ps1：Windows 上 Chromium 用自带 clang-cl，
+#          chromium/build/toolchain/win/toolchain.gni 里 cl_prefix 会拼上 cc_wrapper）；
+#     3) 每轮的 build 阶段带一个时间预算（默认 300 分钟），到点被步超时打断，
+#        此时源码与中间产物都丢弃，但 ccache 已经积累了这一轮编完的目标文件；
+#     4) 每轮结束把 ccache 存到外部（见 cache_backend），下一轮取回来接着编；
+#     5) 冷缓存要若干轮才收敛，缓存热了之后一轮就能编完并打包——kiwi 的经验是一小时出头。
+#   轮次之间靠 STATE_FILE 区分三种结局：
+#     ok         = 编完了，继续 finish / 打包 / 验收
+#     failed N   = 编译报错或根本没进到编译（环境/工具/未 configure），直接失败，
+#                  不进入下一轮（否则会在坏代码上无限轮下去）
+#     文件不存在 = 被时间预算打断，存缓存 + 排下一轮
+#
+# 运行环境要求（触发前请先读这一段）
+#   * 磁盘（这是本方案真正的门槛，不是时间）：Chromium 源码+子模块约 40 GB、
+#     构建中间产物（Release、symbol_level 归零后）约 20-40 GB、Qt 与下载的 Chromium
+#     工具链约 10 GB，合计 70-90 GB；ccache 另需 cache_max_size 那么多。
+#     文档口径的标准托管 runner 是 14 GB SSD，实测的 windows-2022 也只有几十 GB 可用，
+#     所以：要么用大规格 runner（larger runners，300 GB+ SSD），要么自托管。
+#     预检会先量盘，不达标直接失败并打印可选出路；
+#   * CPU/内存：建议 ≥ 8 核 / ≥ 32 GB。16 GB 也能跑，靠页面文件兜底（会自动扩）；
+#   * 工具链：Visual Studio 2022 17.14（MSVC 14.44）。cppgc 补丁针对这个版本；
+#   * 时间预算与自动续跑：auto_continue 需要 CACHE_TOKEN（PAT，workflow 权限）——
+#     GITHUB_TOKEN 不能触发新的 workflow 运行，这是平台限制。
+#
+# 产物与验收
+#   * 产物：qtwebengine-<版本>-win64-msvc2022-codecs.zip（Qt6WebEngineCore.dll、
+#     QtWebEngineProcess.exe、Qt6WebEngineWidgets/Quick*.dll、resources/、
+#     translations/qtwebengine_locales/）+ sha256；
+#   * 验收门：zip 的内容铺进一个临时 venv 里真装的 PySide6==<版本>，离屏起 WebEngine
+#     实测 H.264/AAC（scripts/qtwebengine/verify-codecs.py），并用 vp8/opus 做对照，
+#     防止「整条媒体管线被关掉」被误判为成功。不通过则不产 zip、不发 Release。
+#   * 铺到开发机/打包机：scripts/qtwebengine/install-webengine-runtime.ps1
+# ============================================================================
+
+name: build-qtwebengine
+
+on:
+  workflow_dispatch:
+    inputs:
+      round:
+        description: '第几轮（纯记账，便于在作业列表里一眼看出进度）'
+        type: number
+        default: 1
+      qt_version:
+        description: 'Qt / PySide6 版本（同时决定 qtwebengine 源码分支）'
+        type: string
+        default: '6.8.3'
+      qtwebengine_ref:
+        description: 'qtwebengine 分支/标签（留空 = 取 qt_version）'
+        type: string
+        default: ''
+      pyside_version:
+        description: '验收用的 PySide6 版本（留空 = 取 qt_version）'
+        type: string
+        default: ''
+      runner:
+        description: 'runs-on 标签（需要 70 GB+ 可用磁盘：大规格 runner 或自托管）'
+        type: string
+        default: 'windows-2022'
+      build_type:
+        description: 'CMake 构建类型。Release 符号最少、最快、最省盘；RelWithDebInfo 会多花数小时与几十 GB'
+        type: choice
+        options:
+          - Release
+          - RelWithDebInfo
+        default: 'Release'
+      use_ccache:
+        description: '开启 ccache（分轮续跑与快速迭代都依赖它）'
+        type: boolean
+        default: true
+      cache_backend:
+        description: '缓存存哪儿：actions-cache 受仓库 10 GB 配额限制；git-repo 存到独立仓库（kiwi 的做法，需要 CACHE_TOKEN）'
+        type: choice
+        options:
+          - actions-cache
+          - git-repo
+        default: 'actions-cache'
+      cache_repo:
+        description: 'git-repo 后端：缓存仓库（owner/name，需 CACHE_TOKEN 可写）'
+        type: string
+        default: ''
+      ccache_max_size:
+        description: 'ccache 容量上限（留空 = actions-cache 用 9G、git-repo 用 20G）'
+        type: string
+        default: ''
+      ccache_version:
+        description: 'ccache 官方 Windows 版本（免安装 zip）'
+        type: string
+        default: '4.14.1'
+      build_budget_minutes:
+        description: '单轮 build 阶段的时间预算（分钟）；到点被打断并留到下一轮。0 = 不设（自托管可用）'
+        type: number
+        default: 300
+      jumbo:
+        description: '启用 jumbo build（合并翻译单元，编译更快，但每单元更吃内存）'
+        type: boolean
+        default: false
+      parallel:
+        description: '并行度（留空 = 按 CPU 与内存自动换算）'
+        type: string
+        default: ''
+      shallow_submodule:
+        description: 'Chromium 子模块浅克隆（省时间磁盘；configure 报缺 git 历史时改 false）'
+        type: boolean
+        default: true
+      skip_patch:
+        description: '跳过补丁（仅当上游已修好 cppgc 的 C2352）'
+        type: boolean
+        default: false
+      min_free_gb:
+        description: '构建盘最小可用空间（GB），低于此值直接失败'
+        type: number
+        default: 90
+      pagefile_gb:
+        description: '构建盘页面文件上限（GB，0 = 不动）。内存 ≤ 32 GB 时留默认值给链接兜底'
+        type: number
+        default: 24
+      skip_preflight:
+        description: '跳过磁盘门槛（只为在标准 runner 上试通管线，不产出可用产物）'
+        type: boolean
+        default: false
+      timeout_minutes:
+        description: '作业超时（分钟）。托管 runner 上限 360'
+        type: number
+        default: 360
+      auto_continue:
+        description: '未完则自动派下一轮（需要 CACHE_TOKEN；GITHUB_TOKEN 无法触发 workflow）'
+        type: boolean
+        default: false
+      create_release:
+        description: '构建与验收通过后发布 GitHub Release'
+        type: boolean
+        default: false
+      release_tag:
+        description: 'Release 标签（留空 = qtwebengine-<版本>-win64-msvc2022-codecs）'
+        type: string
+        default: ''
+
+permissions:
+  contents: write
+
+# 同版本构建串行：两条几小时的作业同时抢磁盘与网络只会互相拖死
+concurrency:
+  group: build-qtwebengine-${{ inputs.qt_version }}
+  cancel-in-progress: false
+
+env:
+  QT_VERSION: ${{ inputs.qt_version }}
+  QTWEBENGINE_REF: ${{ inputs.qtwebengine_ref }}
+  PYSIDE_VERSION: ${{ inputs.pyside_version != '' && inputs.pyside_version || inputs.qt_version }}
+  BUILD_TYPE: ${{ inputs.build_type }}
+  SHALLOW_SUBMODULE: ${{ inputs.shallow_submodule && '1' || '0' }}
+  SKIP_PATCH: ${{ inputs.skip_patch && '1' || '0' }}
+  USE_CCACHE: ${{ inputs.use_ccache && '1' || '0' }}
+  JUMBO: ${{ inputs.jumbo && '1' || '0' }}
+  PARALLEL: ${{ inputs.parallel }}
+  MIN_FREE_GB: ${{ inputs.min_free_gb }}
+  PAGEFILE_GB: ${{ inputs.pagefile_gb }}
+  CACHE_BACKEND: ${{ inputs.cache_backend }}
+  CACHE_REPO: ${{ inputs.cache_repo }}
+  ROUND_LABEL: ${{ inputs.round }}
+  CCACHE_MAX_SIZE: ${{ inputs.ccache_max_size }}
+  CCACHE_VERSION: ${{ inputs.ccache_version }}
+
+jobs:
+  build:
+    name: QtWebEngine ${{ inputs.qt_version }} · round ${{ inputs.round }} · proprietary codecs
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: ${{ inputs.timeout_minutes }}
+    steps:
+      - name: 取本仓库（构建脚本）
+        uses: actions/checkout@v4
+
+      - name: 预检与工作盘选择
+        shell: pwsh
+        env:
+          RUNNER_LABEL: ${{ inputs.runner }}
+          SKIP_PREFLIGHT: ${{ inputs.skip_preflight && '1' || '0' }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $cs = Get-CimInstance Win32_ComputerSystem
+          $cores = $cs.NumberOfLogicalProcessors
+          $ramGb = [math]::Round($cs.TotalPhysicalMemory / 1GB, 1)
+          $drives = @(Get-PSDrive -PSProvider FileSystem | Where-Object { $_.Free -gt 0 })
+
+          Write-Host '--- 运行环境 ---'
+          Write-Host ("runs-on 标签 : {0}   轮次: {1}" -f $env:RUNNER_LABEL, $env:ROUND_LABEL)
+          Write-Host ("CPU 逻辑核   : {0}" -f $cores)
+          Write-Host ("内存         : {0} GB" -f $ramGb)
+          foreach ($d in $drives) {
+            Write-Host ("磁盘 {0}: 剩余 {1,7:N1} GB / 合计 {2,7:N1} GB" -f $d.Name, ($d.Free / 1GB), (($d.Used + $d.Free) / 1GB))
+          }
+
+          $best = $drives | Sort-Object Free -Descending | Select-Object -First 1
+          $bestFreeGb = [math]::Round($best.Free / 1GB, 1)
+          $minFreeGb = [double]$env:MIN_FREE_GB
+
+          if ($bestFreeGb -lt $minFreeGb) {
+            $msg = @(
+              "[error] 空间最大的盘是 $($best.Name):，剩余 $bestFreeGb GB，低于要求的 $minFreeGb GB。",
+              "        从源码编 QtWebEngine 需要：Chromium 源码+子模块约 40 GB、构建中间产物约 20-40 GB、",
+              "        Qt 与下载的 Chromium 工具链约 10 GB。标准托管 runner 装不下。请任选一条出路后重跑：",
+              "          1) runner 指向大规格托管 runner（larger runners，300 GB+ SSD）；",
+              "          2) runner 指向自托管 Windows 机器（无 6 小时上限，重跑还能走增量）；",
+              "          3) 在本地跑同一条脚本：scripts\qtwebengine\build.cmd（环境变量见其文件头）。"
+            ) -join [Environment]::NewLine
+            if ($env:SKIP_PREFLIGHT -eq '1') {
+              Write-Warning $msg
+            } else {
+              Write-Host $msg
+              throw "磁盘不足：$bestFreeGb GB < $minFreeGb GB"
+            }
+          }
+          if ($ramGb -lt 32) {
+            Write-Warning ("内存 $ramGb GB 低于建议值 32 GB；链接阶段依赖页面文件，构建时间也会明显拉长。")
+          }
+
+          $workRoot = "$($best.Name):\qtwebengine-work"
+          $parallel = if ([string]::IsNullOrWhiteSpace($env:PARALLEL)) {
+            [math]::Max(1, [math]::Min($cores, [math]::Floor($ramGb / 4)))
+          } else { $env:PARALLEL }
+          # ccache 上限：actions-cache 受仓库 10 GB 配额约束，留出余量当 9G；git-repo 用 kiwi 的 20G
+          $cacheMax = if (-not [string]::IsNullOrWhiteSpace($env:CCACHE_MAX_SIZE)) {
+            $env:CCACHE_MAX_SIZE
+          } elseif ($env:CACHE_BACKEND -eq 'git-repo') { '20G' } else { '9G' }
+
+          $vars = [ordered]@{
+            WORK_ROOT         = $workRoot
+            QT_ROOT           = "$($best.Name):\Qt"
+            QT_TOOLS_DIR      = "$($best.Name):\Qt\Tools"
+            QT_PATH           = "$($best.Name):\Qt\$env:QT_VERSION\msvc2022_64"
+            SRC_DIR           = "$workRoot\src\qtwebengine"
+            BUILD_DIR         = "$workRoot\build"
+            INSTALL_PREFIX    = "$workRoot\install"
+            STATE_FILE        = "$workRoot\build-state.txt"
+            CCACHE_DIR        = "$workRoot\ccache"
+            CCACHE_MAX_SIZE   = $cacheMax
+            VERIFY_VENV       = "$workRoot\verify-venv"
+            DIST_DIR          = "$env:GITHUB_WORKSPACE\dist\qtwebengine"
+            PARALLEL          = $parallel
+          }
+          Write-Host '--- 本次路径与环境 ---'
+          foreach ($kv in $vars.GetEnumerator()) {
+            Write-Host ("{0,-15} = {1}" -f $kv.Key, $kv.Value)
+            "$($kv.Key)=$($kv.Value)" >> $env:GITHUB_ENV
+          }
+
+      - name: 扩大页面文件（给链接兜底）
+        shell: pwsh
+        run: |
+          $gb = [int]$env:PAGEFILE_GB
+          if ($gb -le 0) { Write-Host '按输入跳过页面文件调整'; exit 0 }
+          $drive = Split-Path -Qualifier $env:WORK_ROOT
+          $mb = $gb * 1024
+          try {
+            $cs = Get-CimInstance Win32_ComputerSystem
+            if ($cs.AutomaticManagedPagefile) {
+              Set-CimInstance -InputObject $cs -Property @{ AutomaticManagedPagefile = $false } | Out-Null
+            }
+            $existing = Get-CimInstance Win32_PageFileSetting | Where-Object { $_.Name -like "$drive*" } | Select-Object -First 1
+            if ($existing) {
+              Set-CimInstance -InputObject $existing -Property @{ InitialSize = $mb; MaximumSize = $mb } | Out-Null
+            } else {
+              New-CimInstance -ClassName Win32_PageFileSetting -Property @{ Name = "$drive\pagefile.sys"; InitialSize = $mb; MaximumSize = $mb } | Out-Null
+            }
+            Write-Host "页面文件已调整为 $drive 上的 $gb GB"
+          } catch {
+            Write-Warning "页面文件调整失败（不致命，继续构建）：$_"
+          }
+
+      - name: 安装 ccache（官方 Windows 免安装包）
+        if: ${{ inputs.use_ccache }}
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $url = "https://github.com/ccache/ccache/releases/download/v$env:CCACHE_VERSION/ccache-$env:CCACHE_VERSION-windows-x86_64.zip"
+          $zip = Join-Path $env:RUNNER_TEMP 'ccache.zip'
+          Invoke-WebRequest -Uri $url -OutFile $zip
+          Expand-Archive -LiteralPath $zip -DestinationPath (Join-Path $env:RUNNER_TEMP 'ccache-extract') -Force
+          $exe = Get-ChildItem -Path (Join-Path $env:RUNNER_TEMP 'ccache-extract') -Recurse -Filter 'ccache.exe' | Select-Object -First 1
+          if (-not $exe) { throw "ccache.exe not found in $url" }
+          New-Item -ItemType Directory -Path $env:TOOLS_BIN -Force | Out-Null
+          Copy-Item -LiteralPath $exe.FullName -Destination (Join-Path $env:TOOLS_BIN 'ccache.exe') -Force
+          & (Join-Path $env:TOOLS_BIN 'ccache.exe') --version
+
+      # 缓存外存：两条路二选一。actions-cache 由 post 步骤自动回写，上限 10 GB/仓库；
+      # git-repo 就是 kiwi 的做法——把 ccache 目录当 git 仓库，每轮结束提交推送。
+      - name: 恢复 ccache（actions-cache）
+        if: ${{ inputs.use_ccache && inputs.cache_backend == 'actions-cache' }}
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.CCACHE_DIR }}
+          key: ccache-${{ inputs.qt_version }}-${{ github.run_number }}
+          restore-keys: |
+            ccache-${{ inputs.qt_version }}-
+
+      - name: 恢复 ccache（git-repo）
+        if: ${{ inputs.use_ccache && inputs.cache_backend == 'git-repo' }}
+        shell: pwsh
+        env:
+          CACHE_TOKEN: ${{ secrets.CACHE_TOKEN }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if ([string]::IsNullOrWhiteSpace($env:CACHE_REPO)) { throw 'cache_backend=git-repo 需要同时填 cache_repo' }
+          if ([string]::IsNullOrWhiteSpace($env:CACHE_TOKEN)) { throw 'cache_backend=git-repo 需要仓库密钥 CACHE_TOKEN（PAT，可写缓存仓库）' }
+          New-Item -ItemType Directory -Path $env:CCACHE_DIR -Force | Out-Null
+          $url = "https://x-access-token:$($env:CACHE_TOKEN)@github.com/$($env:CACHE_REPO).git"
+          if (Test-Path (Join-Path $env:CCACHE_DIR '.git')) {
+            git -C $env:CCACHE_DIR pull --ff-only
+          } else {
+            git clone $url $env:CCACHE_DIR
+          }
+          if ($LASTEXITCODE -ne 0) { throw '缓存仓库读写失败' }
+          Write-Host ("缓存目录当前大小：{0:N1} MB" -f ((Get-ChildItem $env:CCACHE_DIR -Recurse -File | Measure-Object Length -Sum).Sum / 1MB))
+
+      - name: 准备 Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: 安装构建期 Python 依赖
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          python -m pip install --disable-pip-version-check --quiet --upgrade pip
+          python -m pip install --disable-pip-version-check --quiet html5lib spdx-tools aqtinstall==3.3.0
+          python -c "import html5lib, spdx_tools, aqt; print('html5lib / spdx-tools / aqt ok')"
+
+      - name: 准备 Node 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: 安装 Qt ${{ inputs.qt_version }}（含 Ninja 工具）
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          python -m aqt install-qt windows desktop $env:QT_VERSION win64_msvc2022_64 -O $env:QT_ROOT
+          python -m aqt install-tool windows desktop tools_ninja -O $env:QT_ROOT
+          if (-not (Test-Path "$env:QT_PATH\bin\qt-configure-module.bat")) {
+            throw "未找到 $env:QT_PATH\bin\qt-configure-module.bat，Qt 安装不完整"
+          }
+          Write-Host "Qt 就位：$env:QT_PATH"
+
+      - name: 安装 gperf / bison / flex
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if (-not (Get-Command gperf -ErrorAction SilentlyContinue)) {
+            choco install gperf -y --no-progress
+          }
+          if (-not (Get-Command win_bison -ErrorAction SilentlyContinue)) {
+            choco install winflexbison3 -y --no-progress
+          }
+          "C:\ProgramData\chocolatey\bin" >> $env:GITHUB_PATH
+          foreach ($t in 'gperf', 'win_bison', 'win_flex', 'perl', 'ninja') {
+            $c = Get-Command $t -ErrorAction SilentlyContinue
+            if (-not $c) { throw "缺少构建依赖：$t" }
+            Write-Host ("{0,-10} {1}" -f $t, $c.Source)
+          }
+
+      - name: 准备阶段（环境 / 源码 / 补丁 / configure）
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Path $env:DIST_DIR -Force | Out-Null
+          $log = Join-Path $env:DIST_DIR "prepare-round${{ inputs.round }}.log"
+          $script = Join-Path $env:GITHUB_WORKSPACE 'scripts\qtwebengine\build.cmd'
+          Write-Host "日志：$log"
+          & cmd.exe /c "`"$script`" prepare 2>&1" | Tee-Object -FilePath $log
+          if ($LASTEXITCODE -ne 0) { throw "prepare 阶段失败（退出码 $LASTEXITCODE），日志见 $log" }
+
+      - name: 构建阶段（受时间预算约束，到点被打断留给下一轮）
+        shell: pwsh
+        timeout-minutes: ${{ inputs.build_budget_minutes > 0 && inputs.build_budget_minutes || inputs.timeout_minutes }}
+        continue-on-error: true
+        run: |
+          $log = Join-Path $env:DIST_DIR "build-round${{ inputs.round }}.log"
+          $script = Join-Path $env:GITHUB_WORKSPACE 'scripts\qtwebengine\build.cmd'
+          Write-Host "日志：$log"
+          & cmd.exe /c "`"$script`" build 2>&1" | Tee-Object -FilePath $log
+          Write-Host "构建阶段退出码：$LASTEXITCODE"
+
+      - name: ccache 是否真的生效（对照 gn cc_wrapper 注入）
+        if: ${{ always() && inputs.use_ccache }}
+        shell: pwsh
+        run: |
+          if (-not (Test-Path (Join-Path $env:TOOLS_BIN 'ccache.exe'))) {
+            Write-Warning 'ccache.exe 不在 TOOLS_BIN，跳过统计'
+            exit 0
+          }
+          # 没有构建树就没有编译，也就一次 ccache 调用都不该有：那是 prepare/configure
+          # 的问题，报成「cc_wrapper 没生效」会把真故障盖掉、方向指错。
+          if ([string]::IsNullOrWhiteSpace($env:BUILD_DIR) -or
+              -not (Test-Path (Join-Path $env:BUILD_DIR 'CMakeCache.txt'))) {
+            Write-Warning '本轮没走到编译（没有 CMakeCache.txt），跳过 ccache 生效性判定；请先看 prepare 阶段与 configure 的报错。'
+            exit 0
+          }
+          $stats = & (Join-Path $env:TOOLS_BIN 'ccache.exe') --show-stats
+          $stats | Write-Host
+          $cacheable = ($stats | Select-String -Pattern 'Cacheable calls' | Select-Object -First 1)
+          Write-Host "ccache: $cacheable"
+          if ($cacheable -and $cacheable -match ':\s*(\d+)') {
+            if ([int]$Matches[1] -eq 0) {
+              throw 'ccache 一次都没被调用：gn cc_wrapper 没生效，下一轮不会有任何进展。检查 scripts/qtwebengine/patch-gn-args.ps1 的注入结果与 configure 日志。'
+            }
+          } else {
+            Write-Warning '没解析到 Cacheable calls，按 stats 输出人工核对'
+          }
+
+      - name: 判定本轮结局（ok / failed / 被时间预算打断）
+        id: verdict
+        if: always()
+        shell: pwsh
+        run: |
+          $state = if (Test-Path $env:STATE_FILE) { (Get-Content -LiteralPath $env:STATE_FILE -Raw).Trim() } else { '' }
+          $result = if ($state -like 'ok*') { 'ok' } elseif ($state -like 'failed*') { 'failed' } else { 'killed' }
+          "BUILD_RESULT=$result" >> $env:GITHUB_ENV
+          "BUILD_STATE=$state" >> $env:GITHUB_ENV
+          "result=$result" >> $env:GITHUB_OUTPUT
+          Write-Host "本轮结局：$result（state 文件内容：'$state'）"
+          if ($result -eq 'failed') {
+            Write-Host '编译报错或没进到编译，本轮不会排下一轮——先在日志里把报错修掉。'
+          } elseif ($result -eq 'killed') {
+            Write-Host '被时间预算打断：源码与中间产物丢弃，ccache 已积累本轮编完的目标，下一轮接着编。'
+          }
+
+      - name: 收尾阶段（安装 + 打包）
+        if: ${{ steps.verdict.outputs.result == 'ok' }}
+        shell: pwsh
+        run: |
+          $log = Join-Path $env:DIST_DIR "finish-round${{ inputs.round }}.log"
+          $script = Join-Path $env:GITHUB_WORKSPACE 'scripts\qtwebengine\build.cmd'
+          & cmd.exe /c "`"$script`" finish 2>&1" | Tee-Object -FilePath $log
+          if ($LASTEXITCODE -ne 0) { throw "finish 阶段失败（退出码 $LASTEXITCODE），日志见 $log" }
+
+      - name: 归档运行时（zip + sha256）
+        if: ${{ steps.verdict.outputs.result == 'ok' }}
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $name = "qtwebengine-$env:QT_VERSION-win64-msvc2022-codecs"
+          $stage = Join-Path $env:DIST_DIR "qtwebengine-$env:QT_VERSION-win64-msvc2022"
+          $zip = Join-Path $env:DIST_DIR "$name.zip"
+          if (-not (Test-Path $stage)) { throw "未找到待归档目录：$stage" }
+          if (Test-Path $zip) { Remove-Item -LiteralPath $zip -Force }
+          Compress-Archive -Path (Join-Path $stage '*') -DestinationPath $zip -Force
+          $hash = (Get-FileHash -LiteralPath $zip -Algorithm SHA256).Hash.ToLower()
+          "$hash  $name.zip" | Set-Content -LiteralPath (Join-Path $env:DIST_DIR "$name.zip.sha256") -Encoding ascii
+          Write-Host ("zip = {0}  ({1:N1} MB)" -f $zip, ((Get-Item $zip).Length / 1MB))
+          Write-Host "sha256 = $hash"
+
+      - name: 验收门 · 铺进 PySide6 ${{ inputs.pyside_version || inputs.qt_version }} 实测 H.264/AAC
+        if: ${{ steps.verdict.outputs.result == 'ok' }}
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $venv = $env:VERIFY_VENV
+          $stage = Join-Path $env:DIST_DIR "qtwebengine-$env:QT_VERSION-win64-msvc2022"
+          python -m venv $venv
+          $py = Join-Path $venv 'Scripts\python.exe'
+          & $py -m pip install --disable-pip-version-check --quiet --upgrade pip
+          & $py -m pip install --disable-pip-version-check --quiet "PySide6==$env:PYSIDE_VERSION"
+          if ($LASTEXITCODE -ne 0) { throw "安装 PySide6==$env:PYSIDE_VERSION 失败" }
+          $pyside = (& $py -c "import PySide6, os; print(os.path.dirname(PySide6.__file__))" | Select-Object -Last 1).Trim()
+          Write-Host "PySide6 目录：$pyside"
+
+          & "$env:GITHUB_WORKSPACE\scripts\qtwebengine\install-webengine-runtime.ps1" -Source $stage -Destination $pyside -NoBackup
+          if ($LASTEXITCODE -ne 0) { throw '铺入自建运行时失败' }
+
+          & $py "$env:GITHUB_WORKSPACE\scripts\qtwebengine\verify-codecs.py" `
+            --expect-qt-version $env:QT_VERSION `
+            --json-out (Join-Path $env:DIST_DIR 'codec-probe.json')
+          if ($LASTEXITCODE -ne 0) {
+            throw "编解码验收未通过（退出码 $LASTEXITCODE）——自建运行时不可用，不产出产物"
+          }
+
+      - name: 回写 ccache（git-repo 后端；actions-cache 由 post 步骤自动回写）
+        if: ${{ always() && inputs.use_ccache && inputs.cache_backend == 'git-repo' }}
+        shell: pwsh
+        env:
+          CACHE_TOKEN: ${{ secrets.CACHE_TOKEN }}
+        run: |
+          if (-not (Test-Path (Join-Path $env:CCACHE_DIR '.git'))) { Write-Host '没有缓存仓库，跳过'; exit 0 }
+          git -C $env:CCACHE_DIR config user.email 'actions@github.com'
+          git -C $env:CCACHE_DIR config user.name 'github-actions'
+          git -C $env:CCACHE_DIR add -A
+          git -C $env:CCACHE_DIR commit -m "round ${{ inputs.round }} state=$env:BUILD_STATE" 2>&1 | Write-Host
+          git -C $env:CCACHE_DIR push
+          if ($LASTEXITCODE -ne 0) { Write-Warning 'ccache 回写失败：下一轮会从更旧的缓存起步' }
+
+      - name: 汇总到作业页
+        if: always()
+        shell: pwsh
+        env:
+          RUNNER_LABEL: ${{ inputs.runner }}
+        run: |
+          if ([string]::IsNullOrEmpty($env:DIST_DIR)) {
+            Write-Host '预检未完成（DIST_DIR 未设置），跳过汇总'
+            exit 0
+          }
+          $lines = New-Object System.Collections.Generic.List[string]
+          $lines.Add('## QtWebEngine ' + $env:QT_VERSION + ' · 私有编解码器 · round ' + $env:ROUND_LABEL)
+          $lines.Add('')
+          $lines.Add('| 项 | 值 |')
+          $lines.Add('| --- | --- |')
+          $lines.Add('| 运行标签 | ' + $env:RUNNER_LABEL + ' |')
+          $lines.Add('| 本轮结局 | ' + $env:BUILD_RESULT + '（state: ' + $env:BUILD_STATE + '） |')
+          $lines.Add('| ccache | ' + $env:CACHE_BACKEND + ' · 上限 ' + $env:CCACHE_MAX_SIZE + ' |')
+          $zip = Join-Path $env:DIST_DIR "qtwebengine-$env:QT_VERSION-win64-msvc2022-codecs.zip"
+          if (Test-Path $zip) {
+            $lines.Add(('| 产物 | {0:N1} MB |' -f ((Get-Item $zip).Length / 1MB)))
+            $lines.Add('| sha256 | ' + (Get-FileHash -LiteralPath $zip -Algorithm SHA256).Hash.ToLower() + ' |')
+          } else {
+            $lines.Add('| 产物 | 未生成（本轮未完或验收未通过） |')
+          }
+          $probe = Join-Path $env:DIST_DIR 'codec-probe.json'
+          if (Test-Path $probe) {
+            $report = Get-Content -LiteralPath $probe -Raw | ConvertFrom-Json
+            $overall = if ($report.ok) { 'PASS' } else { 'FAIL' }
+            $lines.Add('| 编解码验收 | ' + $overall + ' |')
+            $lines.Add('')
+            $lines.Add('| 判据 | 结果 | 实测 |')
+            $lines.Add('| --- | --- | --- |')
+            foreach ($c in $report.checks) {
+              $mark = if ($c.ok) { 'PASS' } else { 'FAIL' }
+              $lines.Add('| ' + $c.name + ' | ' + $mark + ' | ' + $c.detail + ' |')
+            }
+          }
+          $lines -join [Environment]::NewLine >> $env:GITHUB_STEP_SUMMARY
+
+      - name: 上传产物与日志
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: qtwebengine-${{ inputs.qt_version }}-round${{ inputs.round }}
+          path: |
+            dist/qtwebengine/*.zip
+            dist/qtwebengine/*.sha256
+            dist/qtwebengine/codec-probe.json
+            dist/qtwebengine/*.log
+          if-no-files-found: warn
+          retention-days: 30
+
+      - name: 发布 Release
+        if: ${{ steps.verdict.outputs.result == 'ok' && inputs.create_release }}
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ inputs.release_tag != '' && inputs.release_tag || format('qtwebengine-{0}-win64-msvc2022-codecs', inputs.qt_version) }}
+          name: ${{ format('QtWebEngine {0} · Windows x64 · MSVC 2022 · H.264/AAC', inputs.qt_version) }}
+          body: |
+            PySide6/Qt 开源二进制不含私有编解码器，页面里放不了 MP4/H.264/AAC。这份产物是用
+            `-webengine-proprietary-codecs` 自建的 QtWebEngine ${{ inputs.qt_version }} 运行时，
+            用于覆盖 PySide6==${{ inputs.pyside_version || inputs.qt_version }} 安装目录中的同名文件。
+
+            构建步骤见 `scripts/qtwebengine/build.cmd`，参考手册见
+            https://github.com/open-prison-education/ope-lms/blob/main/WebEngineMP4Build_6.8.3.md
+
+            铺入方式（开发机/打包机）：
+
+            ```powershell
+            scripts/qtwebengine/install-webengine-runtime.ps1 `
+              -Source <解压后的目录> `
+              -Destination <site-packages>\PySide6
+            ```
+
+            验收：发布前已把产物铺进临时 venv 的 PySide6 实测 H.264/AAC，明细见 `codec-probe.json`。
+          files: |
+            dist/qtwebengine/*.zip
+            dist/qtwebengine/*.sha256
+            dist/qtwebengine/codec-probe.json
+          fail_on_unmatched_files: true
+
+      - name: 未完则给出下一轮（并按需自动派发）
+        if: ${{ always() && steps.verdict.outputs.result == 'killed' }}
+        shell: pwsh
+        env:
+          CACHE_TOKEN: ${{ secrets.CACHE_TOKEN }}
+          AUTO_CONTINUE: ${{ inputs.auto_continue && '1' || '0' }}
+        run: |
+          $next = [int]$env.ROUND_LABEL + 1
+          Write-Host '本轮被时间预算打断，缓存已回写。下一轮：'
+          Write-Host "  gh workflow run build-qtwebengine.yml -f round=$next -f qt_version=$env:QT_VERSION"
+          if ($env:AUTO_CONTINUE -ne '1') { exit 0 }
+          if ([string]::IsNullOrWhiteSpace($env:CACHE_TOKEN)) {
+            Write-Host '要自动续跑需要 CACHE_TOKEN（PAT，workflow 权限）：GITHUB_TOKEN 无法触发新的 workflow 运行。'
+            exit 0
+          }
+          $env:GH_TOKEN = $env:CACHE_TOKEN
+          gh workflow run build-qtwebengine.yml `
+            -f round=$next `
+            -f qt_version=$env:QT_VERSION `
+            -f runner='${{ inputs.runner }}' `
+            -f cache_backend=$env:CACHE_BACKEND `
+            -f cache_repo='${{ inputs.cache_repo }}' `
+            -f build_budget_minutes='${{ inputs.build_budget_minutes }}' `
+            -f use_ccache=${{ inputs.use_ccache }} `
+            -f jumbo=${{ inputs.jumbo }}
+          if ($LASTEXITCODE -ne 0) { throw '自动派发下一轮失败' }
+          Write-Host "已派发第 $next 轮"

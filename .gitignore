@@ -1,0 +1,7 @@
+# 构建产物与日志：流水线把暂存树、zip 与日志放在 workspace 的 dist/qtwebengine/ 下
+dist/
+*.log
+
+# 本地语法检查留下的字节码
+__pycache__/
+*.pyc

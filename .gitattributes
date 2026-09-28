@@ -1,0 +1,5 @@
+# 批处理必须带 CRLF：cmd.exe 按字节偏移读批处理，LF-only 的文件会被它读串行
+# （表现为命令首字符被吃掉、行尾粘到下一行）。这份声明让 checkout 出来就是 CRLF，
+# 不依赖开发者本机 core.autocrlf 的设置。
+*.cmd text eol=crlf
+*.bat text eol=crlf
