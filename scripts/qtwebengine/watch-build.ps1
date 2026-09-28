@@ -200,6 +200,10 @@ while ($true) {
         if ($wrapperReport -and $wrapperReport -ne $lastWrapperReport) {
             Write-Watch "  $wrapperReport"
             $lastWrapperReport = $wrapperReport
+            # 也发一条 job annotation：步骤日志在作业结束前拿不到，而 annotation 在
+            # check run 上边跑边能查（gh api .../check-runs/<id>/annotations），
+            # 这样「缓存到底有没有接上」不必等五个小时。
+            Write-Host "::notice title=ccache binding::$wrapperReport; $ccacheText; progress=$progress"
         }
 
         if ($idleMin -ge $StallMinutes -and $progressNum -gt 0) {
@@ -223,6 +227,7 @@ while ($true) {
                     Set-Content -LiteralPath $sentinel -Value "ccache was never called (progress=$progress, $wrapperReport)" -Encoding ascii -ErrorAction Stop
                     $sentinelWritten = $true
                     Write-Watch "wrote sentinel $sentinel (build.cmd turns this round into 'failed')"
+                    Write-Host "::warning title=ccache never called::$why; progress=$progress; free-ram=${freeRam}GB"
                 } catch { }
             }
         }
