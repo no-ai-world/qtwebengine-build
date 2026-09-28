@@ -234,6 +234,38 @@ def check_build_cmd(root: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
+# :run_ps 参数计数
+# ---------------------------------------------------------------------------
+
+RUN_PS_RE = re.compile(r"call\s+:run_ps\s+(\S+)(.*)$", re.IGNORECASE)
+RUN_PS_ARG_RE = re.compile(r'"[^"]*"|\S+')
+# build.cmd 的 :run_ps 只转发 %2..%9，也就是脚本名之后最多 8 个参数。第 9 个会被无声
+# 丢掉，而丢掉一个开关的值会让脚本报「参数缺值」——看起来就像它要检查的那件事失败了。
+# 这不是理论：check-ccache-bound.ps1 -Wrapper "ccache" 就是这么被丢的，白烧一轮。
+RUN_PS_MAX_ARGS = 8
+
+
+def check_run_ps_args(root: Path) -> None:
+    path = root / BUILD_CMD
+    if not path.is_file():
+        return
+    for i, line in enumerate(read_text(path).splitlines(), 1):
+        s = line.strip()
+        if s.lower().startswith("rem"):
+            continue
+        m = RUN_PS_RE.search(s)
+        if not m:
+            continue
+        args = RUN_PS_ARG_RE.findall(m.group(2))
+        if len(args) > RUN_PS_MAX_ARGS:
+            fail(
+                "build.cmd/run_ps",
+                f"line {i}: {m.group(1)} is called with {len(args)} arguments, but :run_ps "
+                f"forwards only {RUN_PS_MAX_ARGS} (%2..%9); the extras are dropped silently",
+            )
+
+
+# ---------------------------------------------------------------------------
 # workflow
 # ---------------------------------------------------------------------------
 
@@ -404,6 +436,7 @@ def main() -> int:
     check_build_cmd(root)
     check_workflow(root)
     check_ccache_wiring(root)
+    check_run_ps_args(root)
 
     for n in notes:
         print(f"note: {n}")

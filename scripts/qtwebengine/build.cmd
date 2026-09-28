@@ -238,10 +238,19 @@ rem ---------------------------------------------------------------------------
 rem Run a sibling PowerShell script with whichever PowerShell is available.
 rem pwsh is preferred; Windows PowerShell 5.1 is trimmed out of some images.
 :run_ps
+rem A ninth argument would be dropped silently (only %2..%9 are forwarded), and a
+rem dropped switch value makes the script fail with a parameter error that looks
+rem like the failure it was checking for. Say so instead of losing a round.
+if not "%~9"=="" echo [warn] :run_ps received more than 8 arguments; the extras are ignored: %~9
 set "PS_EXE=powershell"
 where pwsh >nul 2>nul
 if not errorlevel 1 set "PS_EXE=pwsh"
-%PS_EXE% -NoProfile -ExecutionPolicy Bypass -File "%SCRIPT_DIR%\%~1" %2 %3 %4 %5 %6
+rem Up to eight arguments after the script name (%2..%9). The limit is not
+rem cosmetic: a ninth argument is dropped without a word, and a dropped switch
+rem value makes the script fail with a parameter error that looks like the
+rem thing it was checking for. check-pipeline.py counts the arguments at every
+rem call site, because this cost a round once (check-ccache-bound.ps1 -Wrapper).
+%PS_EXE% -NoProfile -ExecutionPolicy Bypass -File "%SCRIPT_DIR%\%~1" %2 %3 %4 %5 %6 %7 %8 %9
 exit /b %errorlevel%
 
 :defaults
