@@ -12,6 +12,10 @@
 #     并依据上一轮看门狗的内存采样自动定并行度（>=5GB 空闲 → parallel=6，
 #     <1.5GB → parallel=3；NO_AUTOTUNE=1 关闭；.temp/autochain.env 可放 EXTRA_ARGS）
 #
+# 预算取 310 而不是 320：作业上限 360 分钟，而最坏情况是"构建吃满预算 + 收尾步骤全跑 +
+# ccache 回写"。粗算 10(准备) + 310 + 20(收尾/验收/上传) + 10(缓存回写) ≈ 350，留 10 分钟余量；
+# 一旦碰到 360 上限，作业被杀，**post 步骤不会跑，这一轮的缓存回写就丢了**——那比少编 10 分钟亏得多。
+#
 # 注意：被时间预算打断的轮次也会上传 artifact（只有日志，几十 KB），所以判断"有没有产物"
 # 必须看归档那一步的结论，不能看 artifact 数量。
 #
@@ -68,7 +72,7 @@ while [ "$DISPATCHED" -lt "$MAX" ]; do
   esac
 
   MSYS_NO_PATHCONV=1 gh workflow run build-qtwebengine.yml --repo "$REPO" --ref main \
-    -f round="$ROUND" -f qt_version=6.8.3 -f use_ccache=true -f build_budget_minutes=320 $PARAM_ARG $EXTRA_ARGS >> "$LOG" 2>&1
+    -f round="$ROUND" -f qt_version=6.8.3 -f use_ccache=true -f build_budget_minutes=310 $PARAM_ARG $EXTRA_ARGS >> "$LOG" 2>&1
   echo "  已派第 $ROUND 轮 $(date -u)" >> "$LOG"
   ROUND=$((ROUND+1)); DISPATCHED=$((DISPATCHED+1))
   sleep 300
