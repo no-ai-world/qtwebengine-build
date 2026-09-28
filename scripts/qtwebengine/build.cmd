@@ -558,7 +558,7 @@ if errorlevel 1 (
     echo [error] cppgc patch failed
     exit /b 1
 )
-echo [step] patch 2/4: single configuration - the VS generator would build RelWithDebInfo and Debug
+echo [step] patch 2/4: single configuration - a multi-config generator would build RelWithDebInfo and Debug
 call :run_ps patch-single-config.ps1 -SourceRoot "%SRC_DIR%"
 if errorlevel 1 (
     echo [error] single-config patch failed
@@ -621,9 +621,12 @@ rem passing -nomake fails with "Unknown command line option '-nomake'" (measured
 rem Qt 6.8.3). A single-module build adds neither examples nor tests anyway, so there
 rem is nothing to turn off.
 rem -DCMAKE_BUILD_TYPE must be a configuration the installed Qt actually offers.
-rem This is a module build, so Qt's configure wrapper passes no -G and CMake picks its
-rem Windows default, "Visual Studio 17 2022" - a multi-config generator. Such a
-rem generator ignores CMAKE_BUILD_TYPE when it compiles, and the installed Qt force-sets
+rem This is a module build, so Qt's configure wrapper passes no -G. Measured on this
+rem runner the generator ends up being NINJA MULTI-CONFIG, not the Visual Studio
+rem generator: ninja answers "unknown target 'runGn_core_RelWithDebInfo_AMD64', did you
+rem mean 'runGn_core_RelWithDebInfo_AMD64:RelWithDebInfo'?" (per-config target names)
+rem and the tree has build-<config>.ninja files. It is still a multi-config generator,
+rem which is what matters here: it ignores CMAKE_BUILD_TYPE when it compiles, and the installed Qt force-sets
 rem CMAKE_CONFIGURATION_TYPES to "RelWithDebInfo;Debug" (measured: "Building for multiple
 rem configurations: RelWithDebInfo;Debug."). So the value here does not choose what gets
 rem compiled - --config does that in :build and :install - but it is read by Qt's
@@ -674,7 +677,7 @@ if not defined CFG_LINE goto :assert_config_unknown
 echo [env] configuration set: %CFG_LINE%
 echo %CFG_LINE% | findstr /i /c:"%BUILD_TYPE%" >nul
 if errorlevel 1 goto :assert_config_bad
-rem It must also be the ONLY configuration. The Visual Studio generator builds every
+rem It must also be the ONLY configuration. A multi-config generator builds every
 rem configuration in this list, and QtWebEngine wires one gn/ninja tree per entry with
 rem each one a dependency of WebEngineCore - so two entries compile the whole of
 rem Chromium twice (measured: the first tree reached 8038/29705 in 56 minutes with the
@@ -707,7 +710,7 @@ exit /b 1
 
 :assert_config_multi
 echo [error] CMAKE_CONFIGURATION_TYPES is "%CFG_LINE%" but must be exactly "%BUILD_TYPE%"
-echo [error] the Visual Studio generator builds every configuration in that list, and
+echo [error] a multi-config generator builds every configuration in that list, and
 echo [error] QtWebEngine wires one gn/ninja tree per entry, each a dependency of
 echo [error] WebEngineCore, so two entries compile the whole of Chromium twice
 echo [error] patch-single-config.ps1 must inject a CMAKE_CONFIGURATION_TYPES FORCE set
@@ -749,9 +752,10 @@ exit /b 1
 
 :build
 pushd "%BUILD_DIR%"
-rem --config is mandatory here. This tree uses the Visual Studio generator, and for a
-rem multi-config generator a bare "cmake --build ." builds Debug (cmVS10Gen.cxx: with an
-rem empty config it substitutes "Debug"). Debug output carries the debug postfix, so the
+rem --config is mandatory here: this is a multi-config generator tree (measured: Ninja
+rem Multi-Config; the VS generator has the same property - cmVS10Gen.cxx substitutes
+rem "Debug" for an empty config). A bare "cmake --build ." builds the wrong
+rem configuration. Debug output carries the debug postfix, so the
 rem install step below, which asks for %BUILD_TYPE%, would find nothing to install.
 if defined PARALLEL (
     echo [step] cmake --build . --config %BUILD_TYPE% --parallel %PARALLEL%

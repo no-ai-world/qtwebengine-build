@@ -65,6 +65,15 @@ while [ "$DISPATCHED" -lt "$MAX" ]; do
             if awk "BEGIN{exit !($minram >= 5)}"; then PARAM_ARG="-f parallel=6"; fi
             if awk "BEGIN{exit !($minram < 1.5)}"; then PARAM_ARG="-f parallel=3"; fi
           fi
+          # 并发编译器数也要看：外层是 Ninja Multi-Config，外层 ninja 可以同时跑 core 与 pdf
+          # 两棵内层 ninja，各自吃 NINJAFLAGS 的 -j，于是实际并发可能翻倍。
+          # 观测到 >=7 个 cl 就说明翻倍发生了，直接降档，不再看内存。
+          if [ -n "$maxcl" ]; then
+            if awk "BEGIN{exit !($maxcl >= 7)}"; then
+              PARAM_ARG="-f parallel=3"
+              echo "  观测到最多 $maxcl 个并发 cl（疑似两棵内层 ninja 同时跑）→ 降到 parallel=3" >> "$LOG"
+            fi
+          fi
           echo "  自动定档：parallel=${PARAM_ARG:-默认（按核数与内存自动算）}" >> "$LOG"
         fi
       fi
