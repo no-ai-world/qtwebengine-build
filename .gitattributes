@@ -3,3 +3,6 @@
 # 不依赖开发者本机 core.autocrlf 的设置。
 *.cmd text eol=crlf
 *.bat text eol=crlf
+# shell 脚本必须 LF：本机（Windows）core.autocrlf=true 会把 LF 转成 CRLF，
+# shebang 带上  之后 bash 会报 "bad interpreter: No such file or directory"
+*.sh text eol=lf
