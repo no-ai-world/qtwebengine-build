@@ -108,6 +108,17 @@ scripts\qtwebengine\build.cmd all
 
 `build.cmd` 头部注释列了全部环境变量与退出码；`prepare` / `build` / `finish` 也可以分开跑。
 
+改完先自检，再决定要不要派线上跑 —— 它只做静态检查，不编译、不联网：
+
+```powershell
+python scripts/check-pipeline.py
+```
+
+它盯的是那些「几分钟就能发现、却要烧掉一台 runner 和半小时到几小时才能暴露」的问题：
+批处理的 CRLF/ASCII、`goto`/`call` 标签是否存在、块括号是否配平、`cmake --build`/`--install`
+是否带了 `--config`、确定性失败有没有落盘成 `failed`（漏了就会被误判成超时并无限续跑）、
+workflow 里引用的 step id 是否存在、自动续跑是否漏传输入。
+
 ## 文件
 
 ```
@@ -118,4 +129,5 @@ scripts/qtwebengine/
   patch-gn-args.ps1                       往 QtWebEngine 的 Chromium 构建注入 gn 参数（cc_wrapper）
   install-webengine-runtime.ps1           把产物铺进 PySide6（版本核对、备份）
   verify-codecs.py                        编解码验收探针（退出码即结论）
+  check-pipeline.py                       流水线静态自检（派 CI 之前先跑，不编译不联网）
 ```
