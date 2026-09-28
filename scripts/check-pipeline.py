@@ -329,6 +329,12 @@ def check_workflow(root: Path) -> None:
             "auto-continue is not guarded against the ccache step failing (a round with "
             "zero compilations would re-dispatch itself)",
         )
+    if "本轮判定为 failed" not in text:
+        fail(
+            "workflow/state",
+            "verdict does not fail the job on a deterministic failure: a broken build would "
+            "end green, hiding the failure and defeating any auto-continuation gate",
+        )
     if "steps.prepare.outcome" not in text:
         fail(
             "workflow/loop",

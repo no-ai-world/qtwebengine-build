@@ -504,6 +504,9 @@ jobs:
           Write-Host "本轮结局：$result（state 文件内容：'$state'）"
           if ($result -eq 'failed') {
             Write-Host '编译报错或没进到编译，本轮不会排下一轮——先在日志里把报错修掉。'
+            # 确定性失败要让作业红掉：以前这里只是打印一行，于是编译报错的一轮在外层看是绿色，
+            # 失败被绿色盖住，也没法让任何"上一轮失败了就别再自动续跑"的闸门看出区别。
+            throw '本轮判定为 failed（确定性失败，不是被时间预算打断）：先看日志里的报错'
           } elseif ($result -eq 'killed') {
             if ($env:USE_CCACHE -eq '1') {
               Write-Host '被时间预算打断：构建目录随 runner 丢弃，但本轮编完的目标已进 ccache（是否真的进了，看 ccache 一步的统计）；下一轮用这份缓存接着编。'
