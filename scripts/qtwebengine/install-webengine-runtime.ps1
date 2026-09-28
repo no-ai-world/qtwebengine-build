@@ -126,7 +126,12 @@ if (Test-Path -LiteralPath $resSrc) {
     if (Test-Path -LiteralPath $locSrc) {
         $locDst = Join-Path $resDst 'locales'
         New-Item -ItemType Directory -Path $locDst -Force | Out-Null
-        Copy-Item -LiteralPath (Join-Path $locSrc '*') -Destination $locDst -Recurse -Force
+        # 不能用 -LiteralPath <dir>\*：-LiteralPath 不做通配展开，星号会被当成文件名，
+        # 于是整句报 "Cannot find path ...*" 并以 $ErrorActionPreference=Stop 中止收尾阶段。
+        # 逐项拷内容（Get-ChildItem 展开），空目录也不会报错。
+        Get-ChildItem -LiteralPath $locSrc -Force | ForEach-Object {
+            Copy-Item -LiteralPath $_.FullName -Destination $locDst -Recurse -Force
+        }
     }
 }
 

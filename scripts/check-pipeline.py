@@ -438,6 +438,41 @@ def check_ccache_wiring(root: Path) -> None:
         fail("ccache/wiring", "symbol_level 输入没有接到 patch-gn-args.ps1 -SymbolLevel 上")
 
 
+# ---------------------------------------------------------------------------
+# PowerShell：-LiteralPath 不做通配展开
+# ---------------------------------------------------------------------------
+
+LITERALPATH_RE = re.compile('-LiteralPath\\s+([^\\r\\n]*?)(?=\\s+-[A-Za-z]|$)')
+
+
+def check_literalpath_wildcards(root: Path) -> None:
+    """-LiteralPath 下的星号不是通配符，是字面量字符。
+
+    `Copy-Item -LiteralPath (Join-Path $dir '*') -Destination ...` 不做展开，直接报
+    "Cannot find path ...*"；由于脚本是 $ErrorActionPreference='Stop'，收尾阶段（安装后
+    打包暂存树）会整段中止。这条路径只有在构建成功那一轮才会跑到，所以这个错误本来要等到
+    一轮十五小时的战役最后一步才暴露——本地拿假安装树跑一次就抓到了。 -Filter 通配是正常的，
+    不在检查范围内（值出现在 -Filter 之后，不在 -LiteralPath 的取值里）。
+    """
+    targets = sorted((root / "scripts").rglob("*.ps1")) + [root / WORKFLOW]
+    for path in targets:
+        if not path.is_file():
+            continue
+        for i, line in enumerate(read_text(path).splitlines(), 1):
+            s = line.strip()
+            if s.startswith("#"):
+                continue
+            for m in LITERALPATH_RE.finditer(line):
+                value = m.group(1)
+                if "*" in value or "?" in value:
+                    fail(
+                        "powershell/literalpath",
+                        f"{path.relative_to(root)}:{i}: -LiteralPath value {value.strip()!r} "
+                        "contains a wildcard; -LiteralPath never expands it (use -Path or "
+                        "enumerate with Get-ChildItem)",
+                    )
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description="流水线静态自检（不编译、不联网）")
     ap.add_argument("--root", default=None, help="仓库根目录，默认取本脚本的上两级")
@@ -448,6 +483,7 @@ def main() -> int:
     check_workflow(root)
     check_ccache_wiring(root)
     check_run_ps_args(root)
+    check_literalpath_wildcards(root)
 
     for n in notes:
         print(f"note: {n}")
