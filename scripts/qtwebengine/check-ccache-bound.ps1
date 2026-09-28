@@ -9,21 +9,23 @@
     bytes because Chromium only wires cc_wrapper for clang toolchains while Qt's MSVC
     build has is_clang=false (see patch-msvc-ccache.ps1).
 
-    This script closes that hole in the prepare phase. It runs the GN generation step
-    for the core module (about four minutes; the build phase then finds it up to date)
-    and reads the ninja files GN wrote: the CC/CXX rules must name the wrapper. It is
-    the strongest cheap evidence available before a single source file is compiled.
+    This script closes that hole in the prepare phase. It runs the GN generation step for
+    the core module (about four minutes; the build phase then finds it up to date) and
+    reads the ninja files GN wrote: the CC/CXX rules must name the wrapper.
 
-    QtWebEngine names that CMake target runGn_core_<config>_<arch> (GN_TARGET is
-    "core_${config}_${arch}" in src/core/CMakeLists.txt), so the architecture is read
-    from the build tree and the name is derived; extra candidates and a `--target help`
-    lookup cover a rename. Not being able to tell is NOT a failure - see exit code 2.
+    Naming the target is the fiddly part. QtWebEngine builds GN_TARGET as
+    "core_${config}_${arch}" (src/core/CMakeLists.txt), and the generator here is
+    Ninja Multi-Config, where the usable target is "<name>:<config>" - a plain
+    "runGn_core_RelWithDebInfo_AMD64" answers "ninja: error: unknown target ..., did you
+    mean 'runGn_core_RelWithDebInfo_AMD64:RelWithDebInfo'?". So candidates are tried in
+    order and ninja's own suggestion is followed; a `--target help` lookup is the last
+    resort. Not being able to tell is NOT a failure - see exit code 2.
 
     Exit codes:
       0 = the wrapper is in the generated rules (bound)
       1 = the rules were generated and no wrapper is in them (hard failure)
       2 = could not generate / could not tell (caller treats it as a warning; the
-          end-of-round ccache check and the build-step watcher still cover this case)
+          build-step watcher reads the same rules again and can stop a dead round)
 
 .PARAMETER BuildDir
     CMake build directory (BUILD_DIR of build.cmd).
@@ -32,8 +34,8 @@
     Configuration to generate for (BUILD_TYPE of build.cmd).
 
 .PARAMETER GnTarget
-    Explicit CMake target that runs GN generation. Empty (default) derives
-    runGn_core_<BuildType>_<arch> from the build tree.
+    Explicit CMake target that runs GN generation. Empty (default) derives candidates
+    from runGn_core_<BuildType>_<arch>.
 
 .PARAMETER Wrapper
     The wrapper name that must appear in the generated rules.
@@ -50,13 +52,40 @@ param(
 )
 
 $ErrorActionPreference = 'Continue'
+$script:tried = New-Object System.Collections.Generic.HashSet[string]
+$script:attempts = 0
+$script:gnLog = Join-Path ([System.IO.Path]::GetTempPath()) ("ccache-bound-gn-{0}.log" -f $PID)
+
+function Invoke-GnTarget {
+    param([string]$Target)
+    if (-not $script:tried.Add($Target)) { return $false }
+    if ($script:attempts -ge 8) { return $false }
+    $script:attempts++
+    Write-Host "[ccache-bound] GN 生成：cmake --build --target $Target --config $BuildType（约四分钟）"
+    # 与构建阶段用的是同一个 target；生成完之后构建阶段会看到它已是最新，不浪费时间
+    # 注意：Tee-Object 会把输入继续往下传，若直接接在管道尾上，函数返回值就会被
+    # cmake 的输出污染（非空数组恒为真），于是失败的尝试也会被当成成功。先接住再输出。
+    $output = & cmake --build $BuildDir --config $BuildType --target $Target *>&1
+    $output | Tee-Object -FilePath $script:gnLog -Append | Out-Null
+    $ok = ($LASTEXITCODE -eq 0)
+    if ($ok) { return $true }
+    Write-Host "[ccache-bound] target '$Target' 没能跑通（cmake 退出码 $LASTEXITCODE）"
+    return $false
+}
+
+function Get-SuggestedTarget {
+    # ninja 会直接说出它认得的名字（Ninja Multi-Config 是 "<name>:<config>"）
+    $hint = Select-String -LiteralPath $script:gnLog -Pattern "did you mean '([^']+)'" -AllMatches -ErrorAction SilentlyContinue |
+        ForEach-Object { $_.Matches } | ForEach-Object { $_.Groups[1].Value } | Select-Object -Last 1
+    return $hint
+}
 
 if (-not (Test-Path -LiteralPath (Join-Path $BuildDir 'CMakeCache.txt'))) {
     Write-Host "[ccache-bound] 没有 CMakeCache.txt：$BuildDir（未 configure？）"
     exit 2
 }
 
-# 架构从构建树里读，而不是猜：src/core/<config>/<arch>/
+# 架构从构建树里读（src/core/<config>/<arch>/），读不到再退回常见写法
 $coreRoot = Join-Path $BuildDir 'src/core'
 $arch = ''
 $configDir = Join-Path $coreRoot $BuildType
@@ -65,23 +94,39 @@ if (Test-Path -LiteralPath $configDir) {
     if ($dirs.Count -ge 1) { $arch = $dirs[0].Name }
 }
 
-$candidates = New-Object System.Collections.Generic.List[string]
-if ($GnTarget) { $candidates.Add($GnTarget) }
-if ($arch) { $candidates.Add("runGn_core_${BuildType}_$arch") }
-foreach ($a in @('AMD64', 'x64', 'ARM64')) { $candidates.Add("runGn_core_${BuildType}_$a") }
-$candidates.Add('runGn_WebEngineCore')
-$candidates = @($candidates | Select-Object -Unique)
+$names = New-Object System.Collections.Generic.List[string]
+if ($GnTarget) { $names.Add($GnTarget) }
+if ($arch) { $names.Add("runGn_core_${BuildType}_$arch") }
+foreach ($a in @('AMD64', 'x64', 'ARM64')) { $names.Add("runGn_core_${BuildType}_$a") }
+$names.Add('runGn_WebEngineCore')
 
-$gnLog = Join-Path ([System.IO.Path]::GetTempPath()) ("ccache-bound-gn-{0}.log" -f $PID)
+# Ninja Multi-Config 的目标名带 :<config>，两种写法都排在前面
+$candidates = New-Object System.Collections.Generic.List[string]
+foreach ($n in ($names | Select-Object -Unique)) {
+    $candidates.Add("${n}:$BuildType")
+    $candidates.Add($n)
+}
+
 $generated = $false
 $usedTarget = ''
+$pending = New-Object System.Collections.Generic.List[string]
+foreach ($c in $candidates) { $pending.Add($c) }
 
-foreach ($target in $candidates) {
-    Write-Host "[ccache-bound] GN 生成：cmake --build --target $target --config $BuildType（约四分钟）"
-    # 与构建阶段用的是同一个 target；生成完之后构建阶段会看到它已是最新，不浪费时间
-    & cmake --build $BuildDir --config $BuildType --target $target *>&1 | Tee-Object -FilePath $gnLog -Append
-    if ($LASTEXITCODE -eq 0) { $generated = $true; $usedTarget = $target; break }
-    Write-Host "[ccache-bound] target '$target' 没能跑通（cmake 退出码 $LASTEXITCODE），试下一个"
+while ($pending.Count -gt 0 -and -not $generated) {
+    $target = $pending[0]
+    $pending.RemoveAt(0)
+    if ($script:tried.Contains($target)) { continue }
+    if (Invoke-GnTarget -Target $target) {
+        $generated = $true
+        $usedTarget = $target
+        break
+    }
+    # ninja 的建议要插到队首：不然它会排在剩下所有猜测之后，甚至轮不到
+    $hint = Get-SuggestedTarget
+    if ($hint -and -not $script:tried.Contains($hint)) {
+        Write-Host "[ccache-bound] ninja 建议的目标名：'$hint'，先试它"
+        $pending.Insert(0, $hint)
+    }
 }
 
 if (-not $generated) {
@@ -89,20 +134,20 @@ if (-not $generated) {
     Write-Host '[ccache-bound] 候选 target 都不通，向 cmake 要一次目标列表'
     $help = & cmake --build $BuildDir --target help 2>&1
     $found = @($help | Select-String -Pattern 'runGn_\S+' -AllMatches |
-        ForEach-Object { $_.Matches } | ForEach-Object { $_.Value } |
+        ForEach-Object { $_.Matches } | ForEach-Object { $_.Value.TrimEnd(':') } |
         Where-Object { $_ -match 'core' } | Select-Object -Unique)
     foreach ($target in $found) {
-        if ($candidates -contains $target) { continue }
-        Write-Host "[ccache-bound] 发现目标 $target，试它"
-        & cmake --build $BuildDir --config $BuildType --target $target *>&1 | Tee-Object -FilePath $gnLog -Append
-        if ($LASTEXITCODE -eq 0) { $generated = $true; $usedTarget = $target; break }
+        foreach ($variant in @("${target}:$BuildType", $target)) {
+            if (Invoke-GnTarget -Target $variant) { $generated = $true; $usedTarget = $variant; break }
+        }
+        if ($generated) { break }
     }
 }
 
 if (-not $generated) {
     Write-Host '[ccache-bound] GN 生成没能跑通，本检查跳过（视为「无法判断」）；完整输出见：'
-    Write-Host "  $gnLog"
-    Get-Content -LiteralPath $gnLog -Tail 20 -ErrorAction SilentlyContinue | ForEach-Object { Write-Host "  $_" }
+    Write-Host "  $script:gnLog"
+    Get-Content -LiteralPath $script:gnLog -Tail 20 -ErrorAction SilentlyContinue | ForEach-Object { Write-Host "  $_" }
     exit 2
 }
 

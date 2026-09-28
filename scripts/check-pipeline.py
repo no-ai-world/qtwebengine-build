@@ -404,6 +404,9 @@ def check_ccache_wiring(root: Path) -> None:
         ("'-BuildDir', $env:BUILD_DIR", "看门狗拿不到构建目录，就没法判断 wrapper 有没有进 ninja 规则"),
         ("'-AbortOnDeadCache'", "看门狗不能在「缓存肯定没有、且这一轮编不完」时停手"),
         ("'-BudgetMinutes'", "看门狗不知道时间预算，就无法判断这一轮还编不编得完"),
+        ("'-Heartbeat'", "看门狗不发心跳：作业日志在 in_progress 时拿不到，这一轮就只能事后看"),
+        ("GH_TOKEN: ${{ github.token }}", "构建步没把 token 交给看门狗，心跳发不出去"),
+        ("checks: write", "workflow 没有 checks:write 权限，心跳写不进 check run"),
     ):
         if needle not in workflow:
             fail("ccache/wiring", f"{why}（缺 {needle}）")

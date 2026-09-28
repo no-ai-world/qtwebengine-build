@@ -162,6 +162,10 @@ on:
 
 permissions:
   contents: write
+  # 看门狗把进度/缓存状态写进本作业的 check run（output.summary）：作业日志在
+  # in_progress 时拿不到，check run 可以边走边查。查 job 需要 actions:read。
+  actions: read
+  checks: write
 
 # 同版本构建串行：两条几小时的作业同时抢磁盘与网络只会互相拖死
 concurrency:
@@ -407,6 +411,8 @@ jobs:
 
       - name: 构建阶段（受时间预算约束，到点被打断留给下一轮）
         shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
         # 同 job 级 timeout-minutes：number 输入在此是字符串，必须 fromJSON 转成数字
         timeout-minutes: ${{ fromJSON(inputs.build_budget_minutes) > 0 && fromJSON(inputs.build_budget_minutes) || fromJSON(inputs.timeout_minutes) }}
         continue-on-error: true
@@ -430,7 +436,7 @@ jobs:
             $watchArgs = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $watchScript,
                            '-LogFile', $log, '-OutFile', $watchOut, '-WorkRoot', $env:WORK_ROOT,
                            '-BuildDir', $env:BUILD_DIR, '-BudgetMinutes', '${{ inputs.build_budget_minutes }}',
-                           '-AbortOnDeadCache')
+                           '-AbortOnDeadCache', '-Heartbeat')
             $ccacheExe = Join-Path $env:TOOLS_BIN 'ccache.exe'
             if (Test-Path $ccacheExe) { $watchArgs += @('-CcacheExe', $ccacheExe) }
             $watch = Start-Process -FilePath 'pwsh' -ArgumentList $watchArgs -NoNewWindow -PassThru

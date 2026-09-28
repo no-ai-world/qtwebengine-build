@@ -85,6 +85,15 @@ ccache 不行，而是少接了一根线：
 落一个 `ccache-not-bound.txt` 让 `build.cmd` 把本轮记成 `failed`（而不是超时后无限续跑），
 并停掉编译器进程，把一轮五小时缩成几分钟。
 
+它还会把每轮的状态写进本作业的 check run（`output.summary`，即"心跳"）：作业日志在
+`in_progress` 时拿不到（`logs` 端点是 404，日志 blob 要等作业结束才生成），check run 却能边走边查：
+
+```bash
+gh api repos/<owner>/<repo>/check-runs/<check_run_id> --jq .output.summary
+```
+
+于是"这一轮进度多少、内存够不够、缓存有没有在跑"不必等五小时。
+
 时间预算照旧：`build_budget_minutes` 默认 300 分钟。够不够一轮编完要看实测；不够就靠 ccache 分轮，
 `auto_continue` 这才重新有意义（仍需要 `CACHE_TOKEN`）。
 
@@ -167,7 +176,7 @@ scripts/qtwebengine/
   patch-single-config.ps1                 把 CMAKE_CONFIGURATION_TYPES 收成一个配置（否则编两遍）
   patch-msvc-ccache.ps1                   让 cc_wrapper 对 MSVC 工具链也生效（ccache 真被调用的前提）
   check-ccache-bound.ps1                  prepare 阶段就证明缓存已接线（跑 GN 生成 + 读 ninja 规则）
-  watch-build.ps1                         构建阶段看门狗（进度/静默/内存/ccache，只观察不杀进程）
+  watch-build.ps1                         构建阶段看门狗（进度/静默/内存/ccache 接线 + check run 心跳）
   install-webengine-runtime.ps1           把产物铺进 PySide6（版本核对、备份）
   verify-codecs.py                        编解码验收探针（退出码即结论）
   check-pipeline.py                       流水线静态自检（派 CI 之前先跑，不编译不联网）

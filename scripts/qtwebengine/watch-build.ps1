@@ -79,7 +79,13 @@ param(
     [int]$IntervalSeconds = 300,
     [int]$StallMinutes = 20,
     [int]$BindingGraceMinutes = 25,
-    [switch]$AbortOnDeadCache
+    [switch]$AbortOnDeadCache,
+
+    # 把每轮的状态写进本作业的 check run（output.summary）。作业日志在 in_progress 时
+    # 拿不到（logs 端点是 404，日志 blob 要等作业结束才生成），而 check run 可以边走边
+    # 查（gh api repos/<o>/<r>/check-runs/<id>），所以这是唯一能中途看见进度的通道。
+    # 需要 checks: write 权限与 GH_TOKEN。
+    [switch]$Heartbeat
 )
 
 $ErrorActionPreference = 'Continue'
@@ -92,6 +98,35 @@ $wrapperMissing = $false
 $wrapperBound = $false
 $reportedNoCalls = $false
 $aborted = $false
+
+$script:checkRunUrl = ''
+$script:heartbeatWarned = $false
+
+function Get-CheckRunUrl {
+    if ($script:checkRunUrl) { return $script:checkRunUrl }
+    if (-not $env:GH_TOKEN -or -not $env:GITHUB_RUN_ID -or -not $env:GITHUB_REPOSITORY) { return '' }
+    try {
+        $url = & gh api "repos/$($env:GITHUB_REPOSITORY)/actions/runs/$($env:GITHUB_RUN_ID)/jobs" --jq '.jobs[0].check_run_url' 2>$null
+        if ($url) { $script:checkRunUrl = "$url".Trim() }
+    } catch { }
+    return $script:checkRunUrl
+}
+
+function Send-Heartbeat {
+    param([string]$Summary)
+    if (-not $Heartbeat) { return }
+    $url = Get-CheckRunUrl
+    if (-not $url) {
+        if (-not $script:heartbeatWarned) {
+            $script:heartbeatWarned = $true
+            Write-Host '[watch] heartbeat unavailable (no GH_TOKEN / GITHUB_RUN_ID, or gh could not read the check run)'
+        }
+        return
+    }
+    try {
+        & gh api -X PATCH $url -f 'output[title]=ccache / progress heartbeat' -f "output[summary]=$Summary" 2>$null | Out-Null
+    } catch { }
+}
 
 function Write-Watch {
     param([string]$Text)
@@ -197,6 +232,10 @@ while ($true) {
         $lastSignature = $signature
         Write-Watch "progress=$progress log-idle=${idleMin}min free-ram=${freeRam}GB $clText $otherText $ccacheText [$changed]"
         if ($lastLine) { Write-Watch "  last: $lastLine" }
+        # 单行摘要：多行参数在 cmd 系包装器上会被拆开（实测 .cmd 垫片收不全），
+        # gh.exe 本身能吃多行，但一行更省事，UI 里也更好看
+        $beat = "progress=$progress | log-idle=${idleMin}min | free-ram=${freeRam}GB | $clText | $ccacheText | $wrapperReport | $($lastLine.Substring(0, [Math]::Min(90, $lastLine.Length)))"
+        Send-Heartbeat -Summary $beat
         if ($wrapperReport -and $wrapperReport -ne $lastWrapperReport) {
             Write-Watch "  $wrapperReport"
             $lastWrapperReport = $wrapperReport
