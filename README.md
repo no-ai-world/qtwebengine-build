@@ -170,6 +170,18 @@ python scripts/qtwebengine/summarize-round.py .temp/r3.log         # 或直接�
 它回答的正是"还能不能靠分轮续跑收口"的几个问题：编到第几个目标、最长静默多久、重活阶段还剩
 多少内存、ccache 被调用了多少次/命中多少/缓存多大、以及按当前速率投影还要多久。
 
+### 不需要守着：本地自动续跑器
+
+一轮编不完、每轮几小时，所以"接着跑下一轮"这件事可以交给脚本（Git Bash，`gh` 已登录即可）：
+
+```bash
+scripts/qtwebengine/autochain.sh 6 8      # 从第 6 轮开始，最多自动派 8 轮
+```
+
+它的规则：CI 队列空了之后——归档出 zip 就停（目标达成）；该轮结论是 `failure` 也停（确定性失败，
+等人工看日志）；否则（被时间预算打断）派下一轮，带 ccache、预算 320 分钟，并按上一轮看门狗的
+内存采样自动定并行度（空闲 ≥ 5 GB → `parallel=6`，< 1.5 GB → `parallel=3`）。日志在 `.temp/autochain.log`。
+
 它盯的是那些「几分钟就能发现、却要烧掉一台 runner 和半小时到几小时才能暴露」的问题：
 批处理的 CRLF/ASCII、`goto`/`call` 标签是否存在、块括号是否配平、`cmake --build`/`--install`
 是否带了 `--config`、确定性失败有没有落盘成 `failed`（漏了就会被误判成超时并无限续跑）、
@@ -188,6 +200,7 @@ scripts/qtwebengine/
   check-ccache-bound.ps1                  prepare 阶段就证明缓存已接线（跑 GN 生成 + 读 ninja 规则）
   watch-build.ps1                         构建阶段看门狗（进度/静默/内存/ccache 接线 + check run 心跳）
   summarize-round.py                      读一轮作业日志：进度/静默/内存/缓存效率/结局，压成一页
+  autochain.sh                            本地自动续跑器：队空就按规则派下一轮（有 zip 或红轮才停）
   install-webengine-runtime.ps1           把产物铺进 PySide6（版本核对、备份）
   verify-codecs.py                        编解码验收探针（退出码即结论）
   check-pipeline.py                       流水线静态自检（派 CI 之前先跑，不编译不联网）
