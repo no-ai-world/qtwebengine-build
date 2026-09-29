@@ -93,6 +93,18 @@ def main() -> int:
     parser.add_argument("--timeout-seconds", type=int, default=90)
     args = parser.parse_args()
 
+    # 这个脚本的提示语是中文，而下面几行 print 是唯一一条会让整件事失败的非断言路径：
+    # Windows 上 stdout 默认是 cp1252（CI 的 hostedtoolcache Python 就是），中文编不出去
+    # 会抛 UnicodeEncodeError，把一次**已经通过**的验收变成退出码 1。第 6 轮就是这么红的：
+    # CODEC-PROBE-JSON 里 mse_h264/mse_aac 全是 true，紧接着在"证据写入…"这句崩掉，
+    # codec-probe.json 与检查清单都没写出来。把两个流都钉成 UTF-8，并把编不出的字符降级
+    # 成占位符——打印永远不该有能力否决验收结论。
+    for _stream in (sys.stdout, sys.stderr):
+        try:
+            _stream.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:  # noqa: BLE001 - 老 Python 或已被重定向的流，忽略即可
+            pass
+
     # 必须在 import QtWebEngine 之前设置：Chromium 只在初始化时读这些开关
     os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
     os.environ.setdefault(
