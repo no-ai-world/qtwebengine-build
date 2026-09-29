@@ -634,7 +634,14 @@ rem get_install_config(), which prefers it over the configuration list. Naming a
 rem configuration that is not in that list (the old default, Release) makes the gn
 rem install rule target a configuration that does not exist. :assert_config below
 rem checks both facts before anything expensive starts.
-call "%QT_PATH%\bin\qt-configure-module.bat" "%SRC_DIR%" -webengine-proprietary-codecs %JUMBO_FLAG% -- -DQT_SHOW_EXTRA_IDE_SOURCES=OFF -DCMAKE_INSTALL_PREFIX="%INSTALL_PREFIX%" -DCMAKE_BUILD_TYPE=%BUILD_TYPE% -DQTWE_BUILD_CONFIGURATION=%BUILD_TYPE%
+call "%QT_PATH%\bin\qt-configure-module.bat" "%SRC_DIR%" -webengine-proprietary-codecs %JUMBO_FLAG% -- -DQT_SHOW_EXTRA_IDE_SOURCES=OFF -DCMAKE_INSTALL_PREFIX="%INSTALL_PREFIX%" -DCMAKE_BUILD_TYPE=%BUILD_TYPE% -DQTWE_BUILD_CONFIGURATION=%BUILD_TYPE% -DFEATURE_webengine_webchannel=ON
+rem -DFEATURE_webengine_webchannel=ON: without it QWebEnginePage::setWebChannel() is compiled
+rem into a no-op that just warns "WebEngine compiled without webchannel support" (the official
+rem Qt binaries have the feature on). It needs Qt::WebChannel to be present in the Qt install
+rem used for the build - the CI step installs the qtwebchannel module for exactly this reason.
+rem How to tell it took effect, on the produced DLL: the string "without webchannel support"
+rem must be ABSENT (it is present in the pre-fix artifact), and an end-to-end probe must round
+rem trip JS -> Python slot over qt.webChannelTransport (.temp/probe-webchannel3.py).
 set "RC=%errorlevel%"
 popd
 if not "%RC%"=="0" (
