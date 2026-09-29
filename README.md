@@ -124,14 +124,18 @@ gh api repos/<owner>/<repo>/check-runs/<check_run_id> --jq .output.summary
 
 ## 产物与消费
 
-`ok` 且验收通过后产出：
+`ok` 后产出：
 
 - `qtwebengine-<版本>-win64-msvc2022-codecs.zip`（`Qt6WebEngineCore.dll`、`QtWebEngineProcess.exe`、
   `Qt6WebEngineWidgets/Quick*.dll`、`resources/`、`translations/qtwebengine_locales/`）+ `.sha256`
-- `codec-probe.json`（编解码验收证据）
 
-验收门不是走过场：产物会被铺进一个临时 venv 里**真装的 PySide6**，离屏起 WebEngine 实测
-H.264/AAC，并用 vp8/opus 做对照（防止「整条媒体管线被关掉」被误判成成功）。不通过就不产 zip、不发 Release。
+**编解码验收不在流水线里**（构建端不再跑 `verify-codecs.py`，产物里也没有 `codec-probe.json`）。
+需要确认时在铺入之后自己跑一遍：它会离屏起 WebEngine 问 H.264/AAC，并用 vp8/opus 做对照，
+防止「整条媒体管线被关掉」被误判成成功：
+
+```powershell
+<venv>\Scripts\python.exe scripts\qtwebengine\verify-codecs.py --expect-qt-version <构建的 Qt 版本>
+```
 
 铺到开发机/打包机（会把旧文件备份到 `_webengine-backup/`，并核对 DLL 版本一致）：
 

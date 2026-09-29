@@ -1,8 +1,9 @@
 # 编解码验收探针：跑在「已铺入自建 QtWebEngine 的 PySide6」之上，断言 H.264/AAC 真的可用。
 #
-# 这是构建链路的验收门（CI 里不通过就不产 zip、不发 Release），也是本仓库既有探针方法学的
-# 延续（.temp/webengine-probe/、.temp/probe-codecs.py 同形）：离屏起一个 QWebEnginePage，
-# 在页面里问 MediaSource.isTypeSupported 与 canPlayType。
+# 注意：它**不在流水线里**了（构建端不跑它，产物里也没有 codec-probe.json）——按需求撤掉了
+# 那一步，改为铺入后手动跑。方法学是本仓库既有探针的延续（.temp/webengine-probe/、
+# .temp/probe-codecs.py 同形）：离屏起一个 QWebEnginePage，在页面里问 MediaSource.isTypeSupported
+# 与 canPlayType。
 #
 # 判据说明（为什么是这几条）：
 #   * mse_h264  —— MSE 的 fMP4/H.264。bilibili 直播与分段 MP4 都走 MSE，这条是主判据；

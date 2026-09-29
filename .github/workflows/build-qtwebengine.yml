@@ -607,7 +607,7 @@ jobs:
             $lines.Add(('| 产物 | {0:N1} MB |' -f ((Get-Item $zip).Length / 1MB)))
             $lines.Add('| sha256 | ' + (Get-FileHash -LiteralPath $zip -Algorithm SHA256).Hash.ToLower() + ' |')
           } else {
-            $lines.Add('| 产物 | 未生成（本轮未完或验收未通过） |')
+            $lines.Add('| 产物 | 未生成（本轮未完或构建未成功） |')
           }
           $probe = Join-Path $env:DIST_DIR 'codec-probe.json'
           if (Test-Path $probe) {
