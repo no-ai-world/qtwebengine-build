@@ -21,13 +21,15 @@
 | 重复发布 | 同一版本再次编成功会更新同一个 Release，并覆盖同名资产（`overwrite_files: true`） |
 | 跳过发布 | 派发时带 `-f create_release=false` |
 
-## 铺进 PySide6
+## 怎么用：铺进 PySide6
 
-```powershell
-scripts/qtwebengine/install-webengine-runtime.ps1 `
-  -Source <解压后的目录> -Destination <site-packages>\PySide6
-```
+解压 zip，把内容覆盖进 `<site-packages>\PySide6\` 下（同名文件直接替换）：
 
-- `-Source` 既接受 CMake 安装前缀（`bin/` 下有 DLL），也接受解压 zip 后的暂存树（DLL 平铺在根上）；
-- 脚本先核对 DLL 版本再覆盖同名文件；默认把旧文件备份到 `_webengine-backup/`（回滚即从该目录拷回）；
-- **版本必须对齐**：产物是给 `PySide6==<构建的 Qt 版本>` 用的，大版本不一致会被拒绝。
+| zip 里的位置 | 目标位置 |
+| --- | --- |
+| 根下的 `Qt6WebEngineCore.dll`、`QtWebEngineProcess.exe`、`Qt6WebEngineWidgets/Quick*.dll` | `<site-packages>\PySide6\` |
+| `resources\` | `<site-packages>\PySide6\resources\` |
+| `translations\` | `<site-packages>\PySide6\translations\` |
+
+**版本必须对齐**：产物只适用于构建它的那个 Qt 版本。`.pyd` 只按 DLL 名解析、不做版本校验，
+错配会变成运行期崩溃而不是加载期报错。

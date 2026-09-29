@@ -831,7 +831,7 @@ exit /b 0
 
 :package
 echo [step] staging built runtime into %DIST_DIR%\qtwebengine-%QT_VERSION%-win64-msvc2022
-call :run_ps install-webengine-runtime.ps1 -Source "%INSTALL_PREFIX%" -Destination "%DIST_DIR%\qtwebengine-%QT_VERSION%-win64-msvc2022" -Create
+call :run_ps stage-webengine-runtime.ps1 -Source "%INSTALL_PREFIX%" -Destination "%DIST_DIR%\qtwebengine-%QT_VERSION%-win64-msvc2022" -Create
 if errorlevel 1 (
     echo [error] packaging failed
     exit /b 1

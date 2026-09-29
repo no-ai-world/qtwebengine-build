@@ -26,12 +26,16 @@ gh workflow run build-qtwebengine.yml --repo <owner>/qtwebengine-build \
 
 ## 用产物
 
-```powershell
-scripts/qtwebengine/install-webengine-runtime.ps1 `
-  -Source <解压后的目录> -Destination <site-packages>\PySide6
+解压 zip，把内容覆盖进目标 PySide6 安装目录的 `PySide6\` 下（同名文件直接替换）：
+
+```
+根下的 DLL/exe  →  <site-packages>\PySide6\
+resources\      →  <site-packages>\PySide6\resources\
+translations\   →  <site-packages>\PySide6\translations\
 ```
 
-脚本会核对 DLL 版本并备份旧文件。产物是给 `PySide6==<构建的 Qt 版本>` 用的，大版本不一致会被拒绝。
+**版本必须对齐**：产物只适用于构建它的那个 Qt 版本。`.pyd` 只按 DLL 名解析、不做版本校验，
+错配会变成运行期崩溃而不是加载期报错。
 
 ## 仓库结构
 
@@ -47,7 +51,7 @@ scripts/qtwebengine/
   patch-msvc-ccache.ps1                    让 cc_wrapper 对 MSVC 工具链也生效（ccache 真被调用的前提）
   check-ccache-bound.ps1                   prepare 阶段就证明缓存已接线（跑 GN 生成 + 读 ninja 规则）
   watch-build.ps1                          构建阶段看门狗（进度/静默/内存/缓存接线 + check run 心跳）
-  install-webengine-runtime.ps1            打包：把安装前缀铺成待分发目录（也用于铺进 PySide6）
+  stage-webengine-runtime.ps1              打包：把安装前缀铺成待分发目录（zip 的来源）
 ```
 
 ## 文档

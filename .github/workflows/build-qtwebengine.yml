@@ -49,7 +49,8 @@
 #   * 编译成功（state=ok）后自动发 Release，标签 qtwebengine-<版本>-win64-msvc2022-codecs，
 #     同一版本再编成功会更新同一个 Release 并覆盖同名资产；
 #   * 本流水线只负责把它编出来并发布，不做产物生效性验证。
-#   * 铺到开发机/打包机：scripts/qtwebengine/install-webengine-runtime.ps1
+#   * 打包：scripts/qtwebengine/stage-webengine-runtime.ps1 把安装前缀铺成待分发目录，
+#     归档步骤再把它压成 zip。
 # ============================================================================
 
 name: build-qtwebengine
@@ -643,18 +644,11 @@ jobs:
             `-webengine-proprietary-codecs` 自建的 QtWebEngine ${{ inputs.qt_version }} 运行时，
             用于覆盖 PySide6==${{ inputs.pyside_version || inputs.qt_version }} 安装目录中的同名文件。
 
-            构建步骤见 `scripts/qtwebengine/build.cmd`，参考手册见
-            https://github.com/open-prison-education/ope-lms/blob/main/WebEngineMP4Build_6.8.3.md
+            铺入方式：解压 zip，把根下的 4 个 DLL/exe 与 `resources\`、`translations\` 覆盖进
+            `<site-packages>\PySide6\`。**版本必须对齐**（产物只适用于构建它的那个 Qt 版本）。
 
-            铺入方式（开发机/打包机）：
-
-            ```powershell
-            scripts/qtwebengine/install-webengine-runtime.ps1 `
-              -Source <解压后的目录> `
-              -Destination <site-packages>\PySide6
-            ```
-
-            这份产物由本仓库的 CI 编译并打包，脚本见 `scripts/qtwebengine/build.cmd`。
+            这份产物由本仓库的 CI 编译并打包，脚本见 `scripts/qtwebengine/build.cmd`；
+            参考手册见 https://github.com/open-prison-education/ope-lms/blob/main/WebEngineMP4Build_6.8.3.md
           files: |
             dist/qtwebengine/*.zip
             dist/qtwebengine/*.sha256
