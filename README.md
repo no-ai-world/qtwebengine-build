@@ -101,7 +101,7 @@ gh api repos/<owner>/<repo>/check-runs/<check_run_id> --jq .output.summary
 
 | state 文件 | 含义 | 流水线动作 |
 | --- | --- | --- |
-| `ok` | 编完了 | 继续 finish / 打包 / 编解码验收 /（可选）发 Release |
+| `ok` | 编完了 | 继续 finish / 打包 / 发 Release |
 | `failed <code>` | 编译报错、根本没进到编译，或 ccache 没绑定（`failed ccache-not-bound`） | 直接失败，**不排下一轮** |
 | 不存在 | 被时间预算打断（含被步超时杀掉的 `0xC000013A`） | 排下一轮；`USE_CCACHE=1` 时下一轮带着 ccache 继续，`=0` 时等于从头再来 |
 
@@ -194,7 +194,7 @@ workflow 里引用的 step id 是否存在、自动续跑是否漏传输入。
 ## 文件
 
 ```
-.github/workflows/build-qtwebengine.yml   流水线（阶段编排、缓存、验收、Release）
+.github/workflows/build-qtwebengine.yml   流水线（阶段编排、缓存、打包、Release）
 scripts/qtwebengine/
   build.cmd                               构建驱动：环境→源码→补丁→configure→编译→安装→打包
   patch-cppgc.ps1                         Chromium v8/cppgc 补丁（MSVC 14.44 的 C2352）

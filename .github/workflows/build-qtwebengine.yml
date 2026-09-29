@@ -151,9 +151,9 @@ on:
         type: boolean
         default: false
       create_release:
-        description: '构建与验收通过后发布 GitHub Release'
+        description: '编译成功后发布 GitHub Release（默认开；传 false 可跳过）'
         type: boolean
-        default: false
+        default: true
       release_tag:
         description: 'Release 标签（留空 = qtwebengine-<版本>-win64-msvc2022-codecs）'
         type: string
@@ -672,6 +672,10 @@ jobs:
             dist/qtwebengine/*.zip
             dist/qtwebengine/*.sha256
           fail_on_unmatched_files: true
+          # 同一版本每编成功一次就更新同一个 tag：默认标签是
+          # qtwebengine-<版本>-win64-msvc2022-codecs，第二次发布时 tag 已存在，
+          # overwrite_files 保证同名资产被替换而不是报 already_exists 把作业判红。
+          overwrite_files: true
 
       - name: 未完则给出下一轮（并按需自动派发）
         # ccache 一步报错说明这一轮一次编译都没发生，续跑只会在同一个报错上再烧一轮，
