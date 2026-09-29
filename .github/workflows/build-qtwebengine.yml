@@ -321,12 +321,21 @@ jobs:
           New-Item -ItemType Directory -Path $env:TOOLS_BIN -Force | Out-Null
           Copy-Item -LiteralPath $exe.FullName -Destination (Join-Path $env:TOOLS_BIN 'ccache.exe') -Force
           & (Join-Path $env:TOOLS_BIN 'ccache.exe') --version
+          # 目录先建出来：下面的回写步骤用 if: always()，构建在很早的阶段就挂掉时
+          # 缓存目录可能还不存在，那时 actions/cache/save 会因为路径不存在而报错。
+          New-Item -ItemType Directory -Path $env:CCACHE_DIR -Force | Out-Null
 
-      # 缓存外存：两条路二选一。actions-cache 由 post 步骤自动回写，上限 10 GB/仓库；
+      # 缓存外存：两条路二选一，上限 actions-cache 10 GB/仓库、git-repo 20 GB；
       # git-repo 就是 kiwi 的做法——把 ccache 目录当 git 仓库，每轮结束提交推送。
+      #
+      # 取用走 actions/cache/restore（而不是 actions/cache）：后者的回写挂在 post 步骤上，
+      # 而 post 步骤带 post-if: success()——只要 job 里任何一个后续步骤变红，整轮攒下的
+      # ccache 就跟着丢。第 5 轮正是如此：构建成功、zip 也归档了，验收门却因脚本 bug 报错，
+      # 于是 post 回写被跳过，那一轮 2.4 万个可缓存目标全部作废。回写改由下面的显式步骤做。
       - name: 恢复 ccache（actions-cache）
+        id: ccache-restore
         if: ${{ inputs.use_ccache && inputs.cache_backend == 'actions-cache' }}
-        uses: actions/cache@v4
+        uses: actions/cache/restore@v4
         with:
           path: ${{ env.CCACHE_DIR }}
           key: ccache-${{ inputs.qt_version }}-${{ github.run_number }}
@@ -454,6 +463,18 @@ jobs:
             }
           }
 
+      # 显式回写，位置就放在构建阶段之后：缓存只有构建阶段往里写，这里存完，后面
+      # （收尾 / 归档 / 验收门 / 上传）任何一步变红都不会再把这一轮的缓存赔进去。
+      # 判红与否看构建本身的结果，不看这一步：万一存失败（配额、网络），下一轮从更旧的
+      # 缓存起步，慢但正确，不该把一个已经成功的构建判成红轮。
+      - name: 回写 ccache（actions-cache 显式保存）
+        if: ${{ always() && inputs.use_ccache && inputs.cache_backend == 'actions-cache' }}
+        continue-on-error: true
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ env.CCACHE_DIR }}
+          key: ccache-${{ inputs.qt_version }}-${{ github.run_number }}
+
       - name: ccache 是否真的生效（对照 gn cc_wrapper 注入）
         id: ccachecheck
         if: ${{ always() && inputs.use_ccache }}
@@ -546,7 +567,16 @@ jobs:
         run: |
           $ErrorActionPreference = 'Stop'
           $venv = $env:VERIFY_VENV
-          $stage = Join-Path $env:DIST_DIR "qtwebengine-$env:QT_VERSION-win64-msvc2022"
+          # 验收对象是**真正要发出去的那个 zip**，不是中间产物：解压出来再铺。
+          # 差一层就差在这：直接铺暂存树会漏掉「打包漏文件」这一整类缺陷
+          # （真出过——产物少语言包，resources 下的 locales 目录当初没进 zip），
+          # 而 zip 解压后的布局也正是用户拿到产物后会喂给同一个脚本的布局。
+          $zip = Join-Path $env:DIST_DIR "qtwebengine-$env:QT_VERSION-win64-msvc2022-codecs.zip"
+          $unzip = Join-Path $env:RUNNER_TEMP 'verify-stage'
+          Remove-Item -Recurse -Force $unzip -ErrorAction SilentlyContinue
+          Expand-Archive -LiteralPath $zip -DestinationPath $unzip -Force
+          Write-Host ("验收源：{0}（解压后 {1:N1} MB）" -f $zip, ((Get-ChildItem $unzip -Recurse -File | Measure-Object Length -Sum).Sum / 1MB))
+          $stage = $unzip
           python -m venv $venv
           $py = Join-Path $venv 'Scripts\python.exe'
           & $py -m pip install --disable-pip-version-check --quiet --upgrade pip
@@ -565,7 +595,7 @@ jobs:
             throw "编解码验收未通过（退出码 $LASTEXITCODE）——自建运行时不可用，不产出产物"
           }
 
-      - name: 回写 ccache（git-repo 后端；actions-cache 由 post 步骤自动回写）
+      - name: 回写 ccache（git-repo 后端；actions-cache 已在构建阶段后显式保存）
         if: ${{ always() && inputs.use_ccache && inputs.cache_backend == 'git-repo' }}
         shell: pwsh
         env:
