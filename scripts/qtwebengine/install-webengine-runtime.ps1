@@ -1,8 +1,12 @@
-﻿# 把自建 QtWebEngine 的运行时文件铺进目标目录。
+# 把自建 QtWebEngine 的运行时文件铺进目标目录。
 #
 # 两个用途共用一份文件清单，因此清单只写在这里一处：
 #   1) 铺进 PySide6 安装目录（开发机 / 打包机）：-Destination <site-packages>\PySide6
 #   2) 铺进空目录做成待分发的暂存树（CI）：      -Destination <dist>\qtwebengine-... -Create
+#
+# -Source 两种布局都接受，别只喂其中一种：
+#   * CMake 安装前缀（cmake --install 的落点）：bin\ 下有 DLL，另有 resources\、translations\
+#   * 暂存树（上面第 2 种用途的产物，也是归档 zip 解压后的样子）：DLL 平铺在根上
 #
 # 为什么需要替换：PySide6 轮子里的 QtWebEngine 是 Qt 开源二进制，不含 H.264/AAC，
 # 所以 <video> 放不了 MP4；自建产物与轮子同为 Qt 6.8.3 + MSVC 2022 x64，按文件名
@@ -48,12 +52,29 @@ $optionalFiles = @(
     'bin\Qt6WebEngineQuickDelegatesQml.dll'
 )
 
+# 源有两种合法布局，本脚本两处用途各用其中一种：
+#   1) CMake 安装前缀：<源>\bin\Qt6WebEngineCore.dll + <源>\resources\...
+#   2) 暂存树：        <源>\Qt6WebEngineCore.dll    + <源>\resources\...
+# 第 2 种就是本脚本 -Create 的产物，也正是归档 zip 解压后的样子——它按 PySide6 的
+# 包根布局把 bin\ 下的东西平铺在根上。两种都必须能吃：CI 的验收门指向暂存树，
+# 人手解压 zip 之后也指向暂存树。早先这里只认 bin\，于是产物本身明明是对的，
+# 验收门却报「源目录缺少必需文件」，整轮被判红。
+$binSrc = Join-Path $Source 'bin'
+if (-not (Test-Path -LiteralPath (Join-Path $binSrc 'Qt6WebEngineCore.dll'))) {
+    if (Test-Path -LiteralPath (Join-Path $Source 'Qt6WebEngineCore.dll')) {
+        $binSrc = $Source
+        Write-Host '[install] 源是暂存树布局（bin\ 下的文件平铺在根上）'
+    }
+}
+
 $missing = @()
 foreach ($rel in $requiredFiles) {
-    if (-not (Test-Path -LiteralPath (Join-Path $Source $rel))) { $missing += $rel }
+    # bin\ 前缀只是「这是 bin 里的文件」的意思，实际位置由布局决定
+    $probe = if ($rel -like 'bin\*') { Join-Path $binSrc (Split-Path $rel -Leaf) } else { Join-Path $Source $rel }
+    if (-not (Test-Path -LiteralPath $probe)) { $missing += $rel }
 }
 if ($missing.Count -gt 0) {
-    Write-Error "[install] 源目录缺少必需文件：$($missing -join ', ')。源应为 CMake 安装前缀（含 bin\ 与 resources\）"
+    Write-Error "[install] 源目录缺少必需文件：$($missing -join ', ')。源应为 CMake 安装前缀（含 bin\ 与 resources\）或暂存树（含 resources\，DLL 平铺在根上）"
     exit 1
 }
 
@@ -69,7 +90,7 @@ if (-not $targetExists) {
 # 原地覆盖已装好的 PySide6 时才做版本核对与备份；暂存树没有可核对的对象
 $overlay = Test-Path -LiteralPath (Join-Path $Destination 'Qt6WebEngineCore.dll')
 if ($overlay) {
-    $srcVer = (Get-Item -LiteralPath (Join-Path $Source 'bin\Qt6WebEngineCore.dll')).VersionInfo.FileVersion
+    $srcVer = (Get-Item -LiteralPath (Join-Path $binSrc 'Qt6WebEngineCore.dll')).VersionInfo.FileVersion
     $dstVer = (Get-Item -LiteralPath (Join-Path $Destination 'Qt6WebEngineCore.dll')).VersionInfo.FileVersion
     Write-Host "[install] 版本核对：自建 $srcVer → 目标 $dstVer"
     if ($srcVer -and $dstVer) {
@@ -103,7 +124,7 @@ $copied = @()
 # 反而找不到；它们由下面的整目录拷贝统一处理。
 foreach ($rel in $requiredFiles + $optionalFiles) {
     if ($rel -notlike 'bin\*') { continue }
-    $src = Join-Path $Source $rel
+    $src = Join-Path $binSrc (Split-Path $rel -Leaf)
     if (-not (Test-Path -LiteralPath $src)) {
         Write-Warning "[install] 跳过（源不存在）：$rel"
         continue
@@ -155,10 +176,18 @@ if (Test-Path -LiteralPath $trSrc) {
 }
 
 Write-Host "[install] 完成，共铺入 $($copied.Count) 项 → $Destination"
+# 这一段只是留证据（尺寸 / sha256），铺入本身到上面已经成功。它不该有能力把整件事判成失败：
+# 调用方（CI 验收门）是看退出码决定红绿的，而这台机器上没有 Get-FileHash 时，$ErrorActionPreference
+# ='Stop' 会让一句打印把「铺入成功」变成「退出码 1」。证据缺失就如实说缺，退出码保持 0。
 $core = Join-Path $Destination 'Qt6WebEngineCore.dll'
 if (Test-Path -LiteralPath $core) {
     $item = Get-Item -LiteralPath $core
-    $hash = (Get-FileHash -LiteralPath $core -Algorithm SHA256).Hash.ToLower()
-    Write-Host ('[install] Qt6WebEngineCore.dll  {0:N1} MB  sha256={1}' -f ($item.Length / 1MB), $hash)
+    $hash = $null
+    try { $hash = (Get-FileHash -LiteralPath $core -Algorithm SHA256).Hash.ToLower() } catch { }
+    if ($hash) {
+        Write-Host ('[install] Qt6WebEngineCore.dll  {0:N1} MB  sha256={1}' -f ($item.Length / 1MB), $hash)
+    } else {
+        Write-Host ('[install] Qt6WebEngineCore.dll  {0:N1} MB  sha256=（本机没有 Get-FileHash，跳过）' -f ($item.Length / 1MB))
+    }
 }
 exit 0
