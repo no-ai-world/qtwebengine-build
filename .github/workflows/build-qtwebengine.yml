@@ -70,7 +70,7 @@ on:
         type: string
         default: ''
       pyside_version:
-        description: '验收用的 PySide6 版本（留空 = 取 qt_version）'
+        description: '产物说明里写的目标 PySide6 版本（留空 = 取 qt_version）'
         type: string
         default: ''
       runner:
@@ -85,7 +85,7 @@ on:
           - Debug
         default: 'RelWithDebInfo'
       use_ccache:
-        description: '开启 ccache（往 gn 注入 cc_wrapper）。实测在 Windows/MSVC 下无效：编译到 8038/29705 个目标后 ccache 缓存仍是 0.0 GB，Chromium 的 cc_wrapper 只被 gcc/clang 工具链读取，MSVC 工具链不看它。因此默认关闭——开着只会在 ccache 一步报错'
+        description: '开启 ccache（往 gn 注入 cc_wrapper，并由 patch-msvc-ccache.ps1 让 MSVC 工具链也认它）。分轮续跑的前提；不开则每轮从头编译'
         type: boolean
         default: false
       cache_backend:
