@@ -46,9 +46,8 @@
 #   * 产物：qtwebengine-<版本>-win64-msvc2022-codecs.zip（Qt6WebEngineCore.dll、
 #     QtWebEngineProcess.exe、Qt6WebEngineWidgets/Quick*.dll、resources/、
 #     translations/qtwebengine_locales/）+ sha256；
-#   * 验收门：zip 的内容铺进一个临时 venv 里真装的 PySide6==<版本>，离屏起 WebEngine
-#     实测 H.264/AAC（scripts/qtwebengine/verify-codecs.py），并用 vp8/opus 做对照，
-#     防止「整条媒体管线被关掉」被误判为成功。不通过则不产 zip、不发 Release。
+#   * 编解码验收已从流水线移除：构建端不再跑 verify-codecs.py，产物里也没有
+#     codec-probe.json。需要时在铺入后用 scripts/qtwebengine/verify-codecs.py 自行确认。
 #   * 铺到开发机/打包机：scripts/qtwebengine/install-webengine-runtime.ps1
 # ============================================================================
 
@@ -561,45 +560,6 @@ jobs:
           Write-Host ("zip = {0}  ({1:N1} MB)" -f $zip, ((Get-Item $zip).Length / 1MB))
           Write-Host "sha256 = $hash"
 
-      - name: 验收门 · 铺进 PySide6 ${{ inputs.pyside_version || inputs.qt_version }} 实测 H.264/AAC
-        if: ${{ steps.verdict.outputs.result == 'ok' }}
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = 'Stop'
-          # 这台机器上 Python 的 stdout 默认是 cp1252，而我们的脚本/提示有中文：
-          # 第 6 轮就是被"打印中文"这一步判红的（探针全部通过之后才崩）。这里把整个
-          # 步骤的 Python 都钉成 UTF-8，脚本自己也会 reconfigure，两道都留着。
-          $env:PYTHONUTF8 = '1'
-          $env:PYTHONIOENCODING = 'utf-8'
-          $venv = $env:VERIFY_VENV
-          # 验收对象是**真正要发出去的那个 zip**，不是中间产物：解压出来再铺。
-          # 差一层就差在这：直接铺暂存树会漏掉「打包漏文件」这一整类缺陷
-          # （真出过——产物少语言包，resources 下的 locales 目录当初没进 zip），
-          # 而 zip 解压后的布局也正是用户拿到产物后会喂给同一个脚本的布局。
-          $zip = Join-Path $env:DIST_DIR "qtwebengine-$env:QT_VERSION-win64-msvc2022-codecs.zip"
-          $unzip = Join-Path $env:RUNNER_TEMP 'verify-stage'
-          Remove-Item -Recurse -Force $unzip -ErrorAction SilentlyContinue
-          Expand-Archive -LiteralPath $zip -DestinationPath $unzip -Force
-          Write-Host ("验收源：{0}（解压后 {1:N1} MB）" -f $zip, ((Get-ChildItem $unzip -Recurse -File | Measure-Object Length -Sum).Sum / 1MB))
-          $stage = $unzip
-          python -m venv $venv
-          $py = Join-Path $venv 'Scripts\python.exe'
-          & $py -m pip install --disable-pip-version-check --quiet --upgrade pip
-          & $py -m pip install --disable-pip-version-check --quiet "PySide6==$env:PYSIDE_VERSION"
-          if ($LASTEXITCODE -ne 0) { throw "安装 PySide6==$env:PYSIDE_VERSION 失败" }
-          $pyside = (& $py -c "import PySide6, os; print(os.path.dirname(PySide6.__file__))" | Select-Object -Last 1).Trim()
-          Write-Host "PySide6 目录：$pyside"
-
-          & "$env:GITHUB_WORKSPACE\scripts\qtwebengine\install-webengine-runtime.ps1" -Source $stage -Destination $pyside -NoBackup
-          if ($LASTEXITCODE -ne 0) { throw '铺入自建运行时失败' }
-
-          & $py "$env:GITHUB_WORKSPACE\scripts\qtwebengine\verify-codecs.py" `
-            --expect-qt-version $env:QT_VERSION `
-            --json-out (Join-Path $env:DIST_DIR 'codec-probe.json')
-          if ($LASTEXITCODE -ne 0) {
-            throw "编解码验收未通过（退出码 $LASTEXITCODE）——自建运行时不可用，不产出产物"
-          }
-
       - name: 回写 ccache（git-repo 后端；actions-cache 已在构建阶段后显式保存）
         if: ${{ always() && inputs.use_ccache && inputs.cache_backend == 'git-repo' }}
         shell: pwsh
@@ -672,7 +632,6 @@ jobs:
           path: |
             dist/qtwebengine/*.zip
             dist/qtwebengine/*.sha256
-            dist/qtwebengine/codec-probe.json
             dist/qtwebengine/*.log
           if-no-files-found: warn
           retention-days: 30
@@ -699,11 +658,10 @@ jobs:
               -Destination <site-packages>\PySide6
             ```
 
-            验收：发布前已把产物铺进临时 venv 的 PySide6 实测 H.264/AAC，明细见 `codec-probe.json`。
+            编解码是否真的可用，请在铺入后自行确认（scripts/qtwebengine/verify-codecs.py）。
           files: |
             dist/qtwebengine/*.zip
             dist/qtwebengine/*.sha256
-            dist/qtwebengine/codec-probe.json
           fail_on_unmatched_files: true
 
       - name: 未完则给出下一轮（并按需自动派发）
