@@ -483,15 +483,12 @@ def check_tools_compile(root: Path) -> None:
     """本地工具脚本至少要能编译：要用它的时候才发现语法坏了最亏。"""
     import py_compile
 
-    for rel in ("scripts/check-pipeline.py", "scripts/qtwebengine/summarize-round.py", "scripts/qtwebengine/verify-codecs.py"):
-        path = root / rel
-        if not path.is_file():
-            fail("tools/compile", f"missing {rel}")
-            continue
+    # glob 而不是写死清单：以后加/删脚本不用回来改这里
+    for path in sorted((root / "scripts").rglob("*.py")):
         try:
             py_compile.compile(str(path), cfile=str(path) + ".pyc-check", doraise=True)
         except py_compile.PyCompileError as exc:
-            fail("tools/compile", f"{rel}: {exc.msg}")
+            fail("tools/compile", f"{path.relative_to(root)}: {exc.msg}")
         finally:
             Path(str(path) + ".pyc-check").unlink(missing_ok=True)
 

@@ -42,12 +42,13 @@
 #   * 时间预算与自动续跑：auto_continue 需要 CACHE_TOKEN（PAT，workflow 权限）——
 #     GITHUB_TOKEN 不能触发新的 workflow 运行，这是平台限制。
 #
-# 产物与验收
+# 产物与发布
 #   * 产物：qtwebengine-<版本>-win64-msvc2022-codecs.zip（Qt6WebEngineCore.dll、
 #     QtWebEngineProcess.exe、Qt6WebEngineWidgets/Quick*.dll、resources/、
 #     translations/qtwebengine_locales/）+ sha256；
-#   * 编解码验收已从流水线移除：构建端不再跑 verify-codecs.py，产物里也没有
-#     codec-probe.json。需要时在铺入后用 scripts/qtwebengine/verify-codecs.py 自行确认。
+#   * 编译成功（state=ok）后自动发 Release，标签 qtwebengine-<版本>-win64-msvc2022-codecs，
+#     同一版本再编成功会更新同一个 Release 并覆盖同名资产；
+#   * 本流水线只负责把它编出来并发布，不做产物生效性验证。
 #   * 铺到开发机/打包机：scripts/qtwebengine/install-webengine-runtime.ps1
 # ============================================================================
 
@@ -268,7 +269,6 @@ jobs:
             STATE_FILE        = "$workRoot\build-state.txt"
             CCACHE_DIR        = "$workRoot\ccache"
             CCACHE_MAX_SIZE   = $cacheMax
-            VERIFY_VENV       = "$workRoot\verify-venv"
             DIST_DIR          = "$env:GITHUB_WORKSPACE\dist\qtwebengine"
             PARALLEL          = $parallel
           }
@@ -618,19 +618,6 @@ jobs:
           } else {
             $lines.Add('| 产物 | 未生成（本轮未完或构建未成功） |')
           }
-          $probe = Join-Path $env:DIST_DIR 'codec-probe.json'
-          if (Test-Path $probe) {
-            $report = Get-Content -LiteralPath $probe -Raw | ConvertFrom-Json
-            $overall = if ($report.ok) { 'PASS' } else { 'FAIL' }
-            $lines.Add('| 编解码验收 | ' + $overall + ' |')
-            $lines.Add('')
-            $lines.Add('| 判据 | 结果 | 实测 |')
-            $lines.Add('| --- | --- | --- |')
-            foreach ($c in $report.checks) {
-              $mark = if ($c.ok) { 'PASS' } else { 'FAIL' }
-              $lines.Add('| ' + $c.name + ' | ' + $mark + ' | ' + $c.detail + ' |')
-            }
-          }
           $lines -join [Environment]::NewLine >> $env:GITHUB_STEP_SUMMARY
 
       - name: 上传产物与日志
@@ -667,7 +654,7 @@ jobs:
               -Destination <site-packages>\PySide6
             ```
 
-            编解码是否真的可用，请在铺入后自行确认（scripts/qtwebengine/verify-codecs.py）。
+            这份产物由本仓库的 CI 编译并打包，脚本见 `scripts/qtwebengine/build.cmd`。
           files: |
             dist/qtwebengine/*.zip
             dist/qtwebengine/*.sha256
