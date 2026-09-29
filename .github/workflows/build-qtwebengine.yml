@@ -383,11 +383,14 @@ jobs:
         run: |
           $ErrorActionPreference = 'Stop'
           # qtwebchannel 必须一起装：aqt 的基础包只有 qtbase/qtdeclarative/qtsvg/qttools/
-          # qttranslations 五个归档，没有它就找不到 Qt::WebChannel，WebEngine 的
-          # webengine_webchannel 特性就一直是关的 —— QWebEnginePage.setWebChannel() 会退化成
-          # 一句 "WebEngine compiled without webchannel support" 的空操作（官方 Qt 构建里这个
-          # 特性是开的，自建要跟它对齐）。PySide6 轮子里自带同版本 Qt6WebChannel.dll，
-          # 所以运行期不需要额外铺文件，这里装它纯粹是为了构建期能找到并链接。
+          # qttranslations（外加 d3dcompiler_47、opengl32sw 两个运行时组件），没有它就找不到
+          # Qt::WebChannel。而 src/core/api/configure.cmake（由 qt_cmdline.cmake 的
+          # qt_commandline_subconfig(src/core/api) 引入）里声明的正是：
+          #     qt_feature("webengine-webchannel" PUBLIC CONDITION TARGET Qt::WebChannel)
+          # 没有 AUTODETECT FALSE，所以缺模块时它会静默判定为关，QWebEnginePage.setWebChannel()
+          # 就退化成一句 "WebEngine compiled without webchannel support" 的空操作
+          # （官方 Qt 构建里这个特性是开的，自建要对齐）。PySide6 轮子自带同版本
+          # Qt6WebChannel.dll，运行期不需要额外铺文件，装它纯粹为了构建期能找到并链接。
           python -m aqt install-qt windows desktop $env:QT_VERSION win64_msvc2022_64 -O $env:QT_ROOT -m qtwebchannel
           python -m aqt install-tool windows desktop tools_ninja -O $env:QT_ROOT
           if (-not (Test-Path "$env:QT_PATH\bin\qt-configure-module.bat")) {

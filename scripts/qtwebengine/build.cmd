@@ -636,9 +636,15 @@ rem install rule target a configuration that does not exist. :assert_config belo
 rem checks both facts before anything expensive starts.
 call "%QT_PATH%\bin\qt-configure-module.bat" "%SRC_DIR%" -webengine-proprietary-codecs %JUMBO_FLAG% -- -DQT_SHOW_EXTRA_IDE_SOURCES=OFF -DCMAKE_INSTALL_PREFIX="%INSTALL_PREFIX%" -DCMAKE_BUILD_TYPE=%BUILD_TYPE% -DQTWE_BUILD_CONFIGURATION=%BUILD_TYPE% -DFEATURE_webengine_webchannel=ON
 rem -DFEATURE_webengine_webchannel=ON: without it QWebEnginePage::setWebChannel() is compiled
-rem into a no-op that just warns "WebEngine compiled without webchannel support" (the official
-rem Qt binaries have the feature on). It needs Qt::WebChannel to be present in the Qt install
-rem used for the build - the CI step installs the qtwebchannel module for exactly this reason.
+rem into a no-op that only warns "WebEngine compiled without webchannel support" (the official
+rem Qt binaries have the feature on). Declaration, from src/core/api/configure.cmake (pulled in
+rem by qt_commandline_subconfig(src/core/api) in qt_cmdline.cmake):
+rem     qt_feature("webengine-webchannel" PUBLIC CONDITION TARGET Qt::WebChannel)
+rem no AUTODETECT FALSE there, so it is on whenever Qt::WebChannel exists - which is why the CI
+rem installs the qtwebchannel module (aqt's base package has only qtbase/qtdeclarative/qtsvg/
+rem qttools/qttranslations). Passing the feature explicitly is belt and braces: if the module
+rem were ever missing again, configure fails here in the prepare step instead of quietly
+rem producing a runtime without WebChannel five hours later.
 rem How to tell it took effect, on the produced DLL: the string "without webchannel support"
 rem must be ABSENT (it is present in the pre-fix artifact), and an end-to-end probe must round
 rem trip JS -> Python slot over qt.webChannelTransport (.temp/probe-webchannel3.py).
