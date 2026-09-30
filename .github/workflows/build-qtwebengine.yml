@@ -231,6 +231,9 @@ jobs:
             throw ("CACHE_TOKEN 派不动 workflow，自动续跑会在轮末失败：" + $probe.Trim() + "`n需要的权限：细粒度 PAT 的 Actions: read and write；经典 PAT 的 repo + workflow。见 docs/cache.md。")
           }
           Write-Host 'CACHE_TOKEN 已配置且可派发 workflow：本轮被时间预算打断后可以自动派下一轮'
+          # 必须显式 exit 0：GitHub 给 pwsh 步骤收尾时会补一句 `exit $LASTEXITCODE`，而探针那条
+          # gh 的退出码是 1（422 正是预期结果）——少了这一行，探针通过了也会把整步判红。
+          exit 0
 
       - name: 预检与工作盘选择
         shell: pwsh
