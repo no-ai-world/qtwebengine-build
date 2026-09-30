@@ -207,7 +207,7 @@ def main() -> int:
     )
     expect(
         "auto_continue 的预检步不再 throw（只打日志，续跑静默断链）",
-        "预检步不 throw",
+        "在 CACHE_TOKEN 为空时不 throw",
         lambda r: edit_workflow(
             r,
             "throw 'auto_continue=true 但没有 CACHE_TOKEN",

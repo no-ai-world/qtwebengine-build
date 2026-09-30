@@ -276,6 +276,27 @@ def check_run_py_args(root: Path) -> None:
 QTWE_DIR = "scripts/qtwebengine"
 
 
+def token_missing_branch_throws(step_body: str) -> bool:
+    """预检步里「秘密为空」那个分支必须真的 `throw`。
+
+    不能只判「这段里有没有 throw」：同一个 step 里还有一段 PAT 探针要 throw，删掉前者的
+    throw 也照样能通过——而前者正是「缺秘密就当场失败」这条守卫本身。所以按结构找：
+    从 `IsNullOrWhiteSpace($env:CACHE_TOKEN)` 那行往下，到这个 if 的收尾 `}` 之前，
+    必须出现一条 `throw`。
+    """
+    lines = step_body.splitlines()
+    for i, line in enumerate(lines):
+        if "IsNullOrWhiteSpace($env:CACHE_TOKEN)" not in line:
+            continue
+        for j in range(i + 1, min(i + 12, len(lines))):
+            stripped = lines[j].strip()
+            if stripped.startswith("}"):
+                break
+            if stripped.startswith("throw"):
+                return True
+    return False
+
+
 def workflow_step_body(workflow: str, name_needle: str) -> str | None:
     """取 workflow 里某个 step 的整段文本（`- name:` 到下一个 `- ` 之前）。
 
@@ -448,10 +469,11 @@ def check_workflow(root: Path) -> None:
             "workflow 没有 auto_continue x CACHE_TOKEN 的预检步：秘密缺失只能在轮末才发现，"
             "自动续跑会静默断链",
         )
-    elif "throw" not in preflight:
+    elif not token_missing_branch_throws(preflight):
         fail(
             "workflow/loop",
-            "auto_continue 的预检步不 throw：CACHE_TOKEN 缺失只会打一行日志，续跑照样静默断链",
+            "auto_continue 的预检步在 CACHE_TOKEN 为空时不 throw：缺秘密只会打一行日志，"
+            "续跑照样静默断链",
         )
 
     # 6. 真正的 YAML 解析（可选，本机可能没有 PyYAML）。

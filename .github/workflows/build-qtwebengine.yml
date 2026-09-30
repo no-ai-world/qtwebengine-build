@@ -215,10 +215,22 @@ jobs:
         env:
           CACHE_TOKEN: ${{ secrets.CACHE_TOKEN }}
         run: |
+          # gh 的 422（ref 不存在）是这一步的**预期**返回值：别让它按错误处理。pwsh 7.4+ 在
+          # $ErrorActionPreference='Stop' 下会把原生命令的非零退出升级成终止错误。
+          $ErrorActionPreference = 'Continue'
           if ([string]::IsNullOrWhiteSpace($env:CACHE_TOKEN)) {
             throw 'auto_continue=true 但没有 CACHE_TOKEN：GITHUB_TOKEN 触发不了新的 workflow 运行，续跑必须用 PAT。做法见 docs/cache.md（gh secret set CACHE_TOKEN --repo <owner>/<repo>；经典 PAT 要 repo+workflow，细粒度 PAT 要 Actions: read and write）。要么配上它，要么改成 auto_continue=false 派发、被打断后手动续派。'
           }
-          Write-Host 'CACHE_TOKEN 已配置：本轮被时间预算打断后可以自动派下一轮'
+          # 秘密在 != 派得动。用**坏 ref** 发一次 dispatch 当探针：权限不够是 403
+          # (Resource not accessible by personal access token)，ref 不存在才是 422
+          # "No ref found"——后者证明鉴权已过，而且不会创建任何运行（实测：派发前后运行编号
+          # 不变）。放在这里就是为了不等到五小时后轮末才发现 403。
+          $env:GH_TOKEN = $env:CACHE_TOKEN
+          $probe = & gh workflow run build-qtwebengine.yml --repo $env:GITHUB_REPOSITORY --ref '__cache-token-probe-not-a-branch__' -f round=0 2>&1 | Out-String
+          if ($probe -notmatch 'No ref found') {
+            throw ("CACHE_TOKEN 派不动 workflow，自动续跑会在轮末失败：" + $probe.Trim() + "`n需要的权限：细粒度 PAT 的 Actions: read and write；经典 PAT 的 repo + workflow。见 docs/cache.md。")
+          }
+          Write-Host 'CACHE_TOKEN 已配置且可派发 workflow：本轮被时间预算打断后可以自动派下一轮'
 
       - name: 预检与工作盘选择
         shell: pwsh
