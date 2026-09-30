@@ -37,7 +37,7 @@ gh workflow run build-qtwebengine.yml --repo <owner>/qtwebengine-build \
 | `pagefile_gb` | `24` | 构建盘页面文件上限（GB，`0` = 不动）；内存 ≤ 32 GB 时留默认值给链接兜底 |
 | `skip_preflight` | `false` | 跳过磁盘门槛（只为在标准 runner 上试通管线，不产出可用产物） |
 | `timeout_minutes` | `360` | 作业超时（分钟）；托管 runner 上限 360 |
-| `auto_continue` | `false` | 未完则自动派下一轮（需要 `CACHE_TOKEN`，见 [cache.md](cache.md)） |
+| `auto_continue` | `false` | 未完则自动派下一轮（需要 `CACHE_TOKEN`，见 [cache.md](cache.md)）。**没配这个秘密时派发当场失败**，不会等到轮末才发现续不动 |
 | `create_release` | `true` | 编译成功后发布 Release（见 [artifacts.md](artifacts.md)） |
 | `release_tag` | 空 | Release 标签（留空 = `qtwebengine-<版本>-win64-msvc2022-codecs`） |
 
@@ -79,4 +79,6 @@ python scripts/check-pipeline.py
 新增的几条——`:run_py` 的参数个数（第 9 个会被无声丢掉）与 `-u`、`scripts/` 下有没有混回 `.ps1`、
 `scripts/qtwebengine/` 下每个脚本是否**真的被调用**（不是被注释提到）、每个 Python 脚本能否编译、
 `build.cmd` 有没有单独处理 `check-ccache-bound.py` 的用法错误退出码 3（它必须与「判断不了」的 2
-分开，否则一次参数写错就静默关掉 ccache 门禁）。
+分开，否则一次参数写错就静默关掉 ccache 门禁）、`build.cmd` 有没有占用 `RC` 这个环境变量名
+（CMake 把 `$ENV{RC}` 当资源编译器路径，占用它会让这道门禁每轮都答「判断不了」），以及
+`auto_continue` 的预检步是否真的 `throw`（`CACHE_TOKEN` 缺失要在几秒内失败，而不是轮末才发现）。

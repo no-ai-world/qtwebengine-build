@@ -29,6 +29,19 @@
 `auto_continue=true` 会在本轮被时间预算打断后自动派下一轮，但**必须提供 `CACHE_TOKEN`**：
 `GITHUB_TOKEN` 无法触发新的 workflow 运行，这是平台限制，不是配置问题。
 
+没配这个秘密时，派发会**在几秒钟内失败**（workflow 里的「预检：auto_continue 需要
+CACHE_TOKEN」一步）；轮末那一步在秘密缺失时也会判红，而不是只打一行日志就放过——那种静默
+降级恰好发生在轮次被打断、最需要续跑的时候。配上它：
+
+```bash
+gh secret set CACHE_TOKEN --repo <owner>/qtwebengine-build
+# 经典 PAT：勾 repo + workflow
+# 细粒度 PAT：只给本仓库的 Actions: read and write
+```
+
+配好之后，被打断的那一轮编出来的目标已经在缓存里，下一轮接着编（`git-repo` 后端也用这个
+秘密推送缓存仓库）。
+
 ## 看进度：prepare 阶段与心跳
 
 - **prepare 阶段**会跑一次 GN 生成并读 GN 写出的 ninja 规则，确认里面出现 `ccache`；

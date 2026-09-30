@@ -41,7 +41,11 @@ wrapper 的名字。
   * 跳过 Hidden/System 项（PS 的 Get-ChildItem 不带 -Force 就是这么做的）；
   * 顺带做对的两件事：ninja 文件按流式逐行扫（不整份读进内存），stdout 强制 UTF-8 + 行缓冲
     （CI 里输出是管道，locale 编码会让中文抛 UnicodeEncodeError，块缓冲还会让「等四分钟」
-    看起来像卡死）。
+    看起来像卡死）；
+  * 再顺带补上一个旧版同样会踩的坑：调用 cmake 之前把**误设的环境变量 `RC`** 摘掉。
+    CMake 把 `$ENV{RC}` 当资源编译器的路径，一个不是文件的值会让 GN 的 configure 直接
+    FATAL_ERROR，于是这份检查永远只能答「判断不了(2)」——门禁静默失效。见
+    sanitized_child_env() 与 check-pipeline.py 里守 `build.cmd` 的对应检查。
 
 已知且**不打算**对齐的差别：PS 的 Write-Error 会打一个 5 行装饰块（脚本名/行号/源码回显 +
 CRLF），这里只打一行。任何按整行锚定的检查都会失配，按子串匹配的不受影响。
@@ -111,6 +115,33 @@ def decode_console_output(raw: bytes) -> str:
     return raw.decode("utf-8", errors="replace")
 
 
+def sanitized_child_env() -> dict[str, str]:
+    """把误设的 `RC` 从子进程环境里摘掉，再交给 cmake。
+
+    CMake 把**环境变量** `RC` 当成资源编译器的路径（CMakeDetermineRCCompiler.cmake：非空就
+    直接拿它当编译器，`get_filename_component(... PROGRAM ...)` 之后 `EXISTS` 不成立就
+    `message(FATAL_ERROR "Could not find compiler set in environment variable RC")`），随后的
+    报错是 `CMAKE_RC_COMPILER not set, after EnableLanguage`，整个 configure 当场失败。
+
+    这个脚本跑的 GN 生成会连带跑 gn 的 ExternalProject configure，于是症状落在**本脚本**
+    头上：规则永远生成不出来，只能返回 2「判断不了」——门禁被静默关掉，而它存在的意义正是
+    拦住这种事。实测过一次：`build.cmd` 原先用 `RC` 存自己的返回码，configure 那步的 `0`
+    泄漏进环境，本脚本里的 cmake 每次都死在上面（见 check-pipeline.py 里守这条的检查）。
+
+    `rc.exe` 由 CMake 自己从 PATH / Windows SDK 里找，所以一个**不指向真实文件**的 `RC`
+    只可能是误设：丢掉它，并说一句。真指向 rc.exe 的值（有人故意设的）保持不动。
+    """
+    env = dict(os.environ)
+    rc = env.get("RC")
+    if rc and not Path(rc).is_file():
+        env.pop("RC", None)
+        print(
+            f"[ccache-bound] 忽略误设的环境变量 RC={rc!r}（不是文件；"
+            "CMake 会把它当成资源编译器路径，GN 的 configure 会直接失败）"
+        )
+    return env
+
+
 def first_line_with(path: Path, needle: str) -> str | None:
     """流式找第一个含 needle 的行（不整份读进内存：ninja 规则文件可以很大）。
 
@@ -158,6 +189,8 @@ def main() -> int:
     build_type = args.BuildType
     wrapper = args.Wrapper
     cmake_exe = shutil.which("cmake") or "cmake"
+    # 一份算好就复用：cmake 每次起进程都继承它，误设的 RC 必须挡在所有 cmake 调用之外。
+    tool_env = sanitized_child_env()
 
     if not (build_dir / "CMakeCache.txt").is_file():
         print(f"[ccache-bound] 没有 CMakeCache.txt：{build_dir}（未 configure？）")
@@ -245,6 +278,7 @@ def main() -> int:
                     ],
                     stdout=fh,
                     stderr=subprocess.STDOUT,
+                    env=tool_env,
                 )
             rc = proc.returncode
         except OSError as exc:
@@ -291,6 +325,7 @@ def main() -> int:
                 [cmake_exe, "--build", str(build_dir), "--target", "help"],
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
+                env=tool_env,
             )
             help_text = decode_console_output(proc.stdout or b"")
         except OSError as exc:

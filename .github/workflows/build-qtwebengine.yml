@@ -205,6 +205,21 @@ jobs:
       - name: 取本仓库（构建脚本）
         uses: actions/checkout@v4
 
+      # auto_continue 只有一种失败方式，而且是最贵的那种：跑满几个小时、被时间预算打断，
+      # 才发现派不动下一轮。GITHUB_TOKEN 触发不了新的 workflow 运行（平台限制，不是配置
+      # 问题），所以续跑必须用 PAT。秘密不在时当场失败——不让它安静地降级成「这一轮编完
+      # 就断链」，那恰好发生在一轮被打断、最需要续跑的时候。
+      - name: 预检：auto_continue 需要 CACHE_TOKEN
+        if: ${{ inputs.auto_continue }}
+        shell: pwsh
+        env:
+          CACHE_TOKEN: ${{ secrets.CACHE_TOKEN }}
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:CACHE_TOKEN)) {
+            throw 'auto_continue=true 但没有 CACHE_TOKEN：GITHUB_TOKEN 触发不了新的 workflow 运行，续跑必须用 PAT。做法见 docs/cache.md（gh secret set CACHE_TOKEN --repo <owner>/<repo>；经典 PAT 要 repo+workflow，细粒度 PAT 要 Actions: read and write）。要么配上它，要么改成 auto_continue=false 派发、被打断后手动续派。'
+          }
+          Write-Host 'CACHE_TOKEN 已配置：本轮被时间预算打断后可以自动派下一轮'
+
       - name: 预检与工作盘选择
         shell: pwsh
         env:
@@ -678,8 +693,7 @@ jobs:
           Write-Host "  gh workflow run build-qtwebengine.yml -f round=$next -f qt_version=$env:QT_VERSION"
           if ($env:AUTO_CONTINUE -ne '1') { exit 0 }
           if ([string]::IsNullOrWhiteSpace($env:CACHE_TOKEN)) {
-            Write-Host '要自动续跑需要 CACHE_TOKEN（PAT，workflow 权限）：GITHUB_TOKEN 无法触发新的 workflow 运行。'
-            exit 0
+            throw '要自动续跑需要 CACHE_TOKEN（PAT，workflow 权限）：GITHUB_TOKEN 无法触发新的 workflow 运行。本轮编完的目标已经进了 ccache，配上秘密后派下一轮即可接着编。'
           }
           $env:GH_TOKEN = $env:CACHE_TOKEN
           # 续跑必须带上所有会改变构建结果的输入。漏掉 build_type 会让第 2 轮换一个

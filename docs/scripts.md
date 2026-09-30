@@ -60,6 +60,15 @@ workflow 里仍有约 450 行内联 `pwsh`（预检、页面文件、缓存下�
 * **跳过 Hidden/System 项**：旧版 `Get-ChildItem` 不带 `-Force` 就会跳过，Python 的
   `iterdir`/`rglob` 不会，所以代码里显式过滤。影响拷贝集、打印条数、`MISSING in N ninja file(s)`。
 
+## `build.cmd` 不能占用的环境变量名
+
+批处理的 `set` 导出的是**环境变量**，每个子进程都继承，所以 `build.cmd` 里不许出现
+`set "RC=..."`：CMake 把 `$ENV{RC}` 当成资源编译器的路径（`CMakeDetermineRCCompiler.cmake` 里值
+不是文件就 `FATAL_ERROR`），而 `check-ccache-bound.py` 跑的 GN 生成会连带跑 `gn` 的
+ExternalProject configure——踩上它，这道门禁每轮都只会答「判断不了(2)」，等于被静默关掉。
+脚本里因此用 `STEP_RC`。第二道在 `check-ccache-bound.py`：起 cmake 之前把**不指向真实文件**的
+`RC` 从子进程环境里摘掉（真指向 `rc.exe` 的值保持不动）；第一道由 `check-pipeline.py` 守着。
+
 ## 这些约定由 `scripts/check-pipeline.py` 守着
 
 改调用点或换脚本名之后先跑一次（不编译、不联网）：
@@ -71,7 +80,9 @@ python scripts/check-pipeline.py
 与脚本层相关的检查：`:run_py` 的参数个数（第 9 个会被无声丢掉）与 `-u`/`-X utf8`、`scripts/` 下
 有没有混回 `.ps1`、`scripts/qtwebengine/` 下每个脚本是否**真的被调用**（判据是调用而不是「注释里
 提到」——build.cmd 与 workflow 的注释、报错文案里都写着脚本名）、每个 Python 脚本能否编译、
-build.cmd 有没有单独处理退出码 3。其余检查项见 [运行与参数](run.md#派之前先自检)。
+build.cmd 有没有单独处理退出码 3、build.cmd 有没有占用 `RC` 这个名字，以及 `auto_continue` 的
+预检步是否真的 `throw`（秘密缺失必须在几秒内失败，而不是轮末才发现）。其余检查项见
+[运行与参数](run.md#派之前先自检)。
 
 ### 两个回归测试
 

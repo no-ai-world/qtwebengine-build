@@ -125,17 +125,26 @@ rem preparing -> no file -> "killed", resume later; prepare fails -> we write "f
 rem below -> the caller stops instead of queueing an identical round.
 if exist "%STATE_FILE%" del "%STATE_FILE%"
 call :step_prepare
-set "RC=%errorlevel%"
-if not "%RC%"=="0" (
+rem Not "RC": `set` here exports an *environment* variable, every child process inherits it,
+rem and CMake reads $ENV{RC} as the resource compiler's path (CMakeDetermineRCCompiler.cmake:
+rem "Could not find compiler set in environment variable RC"). Measured: the return code of
+rem the configure step (0) leaked into the prepare phase's own cmake calls as RC=0, which made
+rem the GN ExternalProject configure die with "CMAKE_RC_COMPILER not set, after EnableLanguage"
+rem - so check-ccache-bound.py could never generate the rules and silently fell back to exit 2
+rem ("could not tell"), which is exactly the gate being switched off. Same trap for
+rem `build.cmd all`, where this variable survives into the build phase. Use a name no tool
+rem reads; check-pipeline.py guards against reintroducing it.
+set "STEP_RC=%errorlevel%"
+if not "%STEP_RC%"=="0" (
     rem Record the failure so the caller does not read an absent state file as "the
     rem time budget ran out, try again". Without this the phases loop forever: every
     rem deterministic prepare error - a bad configure flag, a broken tool shim - left
     rem the file absent, the run reported "killed", and the next round failed the same
     rem way.
     if not exist "%WORK_ROOT%" mkdir "%WORK_ROOT%" 2>nul
-    > "%STATE_FILE%" echo failed %RC%
-    echo [error] prepare failed, code %RC%; state file says failed - no next round will be queued
-    exit /b %RC%
+    > "%STATE_FILE%" echo failed %STEP_RC%
+    echo [error] prepare failed, code %STEP_RC%; state file says failed - no next round will be queued
+    exit /b %STEP_RC%
 )
 goto :done
 
@@ -656,10 +665,10 @@ rem producing a runtime without WebChannel five hours later.
 rem How to tell it took effect, on the produced DLL: the string "without webchannel support"
 rem must be ABSENT (it is present in the pre-fix artifact), and an end-to-end probe must round
 rem trip a JS -> Python slot call over qt.webChannelTransport.
-set "RC=%errorlevel%"
+set "STEP_RC=%errorlevel%"
 popd
-if not "%RC%"=="0" (
-    echo [error] configure failed, code %RC%
+if not "%STEP_RC%"=="0" (
+    echo [error] configure failed, code %STEP_RC%
     exit /b 1
 )
 if not exist "%BUILD_DIR%\CMakeCache.txt" (
@@ -754,15 +763,19 @@ rem generation (about four minutes - the build phase then finds it up to date) a
 rem reads the ninja rules GN wrote: they must name the wrapper. Exit code 2 from the
 rem script means "could not generate / could not tell", which is only a warning: the
 rem end-of-round ccache check and the build-step watcher still cover that case.
+rem Note this step inherits this script's environment, and the script must therefore not
+rem export a variable named RC (see :phase_prepare): CMake would take it for the resource
+rem compiler, the GN generation would fail, and this gate would answer "could not tell"
+rem forever. check-ccache-bound.py drops such a value defensively as well.
 if not "%USE_CCACHE%"=="1" exit /b 0
 if "%SKIP_PATCH%"=="1" (
     echo [warn] SKIP_PATCH=1: cannot verify that cc_wrapper reached the MSVC toolchain
     exit /b 0
 )
 call :run_py check-ccache-bound.py -BuildDir "%BUILD_DIR%" -BuildType "%BUILD_TYPE%" -Wrapper "ccache"
-set "RC=%errorlevel%"
-if "%RC%"=="0" exit /b 0
-if "%RC%"=="2" (
+set "STEP_RC=%errorlevel%"
+if "%STEP_RC%"=="0" exit /b 0
+if "%STEP_RC%"=="2" (
     echo [warn] could not verify the ccache binding before the build; see the log above
     exit /b 0
 )
@@ -770,7 +783,7 @@ rem 3 is the script's "you called me wrong" code. It must not be folded into 2 (
 rem "could not tell" and lets the round continue): a mistyped flag would then silently disable
 rem the cache gate, which is the one thing this step exists to prevent. Say what it is instead
 rem of blaming the source tree. (The script keeps 2 for its own verdict on purpose.)
-if "%RC%"=="3" (
+if "%STEP_RC%"=="3" (
     echo [error] check-ccache-bound.py rejected its own command line ^(exit 3^)
     echo [error] the ccache binding was NOT verified; fix the call site above
     exit /b 1
@@ -794,7 +807,7 @@ if defined PARALLEL (
     echo [step] cmake --build . --config %BUILD_TYPE% --parallel
     call cmake --build . --config %BUILD_TYPE% --parallel
 )
-set "RC=%errorlevel%"
+set "STEP_RC=%errorlevel%"
 popd
 rem 0xC000013A (STATUS_CONTROL_C_EXIT, arrives here as -1073741510) is what cmake
 rem returns when the step's time budget cancels the process tree. Measured: the round
@@ -804,7 +817,7 @@ rem though nothing was wrong with the build. An interruption is not a compile er
 rem leave STATE_FILE absent, which is what the caller reads as "killed, resume later".
 rem A genuine compile error arrives here as ninja's small positive exit code via cmake,
 rem never as this one, so this cannot mask a real failure.
-if "%RC%"=="-1073741510" (
+if "%STEP_RC%"=="-1073741510" (
     rem A budget kill is only worth resuming when the next round has something to resume
     rem from. The build-step watcher drops a sentinel when compiles were clearly
     rem happening and ccache still reported zero calls: then this round is a
@@ -819,23 +832,23 @@ if "%RC%"=="-1073741510" (
     echo [step] interrupted by the step time budget; state file left absent so the next round resumes
     exit /b 5
 )
-if "%RC%"=="0" (
+if "%STEP_RC%"=="0" (
     > "%STATE_FILE%" echo ok
     echo [step] build completed; state file says ok
     exit /b 0
 )
-> "%STATE_FILE%" echo failed %RC%
-echo [error] build failed, code %RC%
+> "%STATE_FILE%" echo failed %STEP_RC%
+echo [error] build failed, code %STEP_RC%
 exit /b 1
 
 :install
 pushd "%BUILD_DIR%"
 echo [step] cmake --install . --config %BUILD_TYPE%
 call cmake --install . --config %BUILD_TYPE%
-set "RC=%errorlevel%"
+set "STEP_RC=%errorlevel%"
 popd
-if not "%RC%"=="0" (
-    echo [error] install failed, code %RC%
+if not "%STEP_RC%"=="0" (
+    echo [error] install failed, code %STEP_RC%
     exit /b 1
 )
 if not exist "%INSTALL_PREFIX%\bin\Qt6WebEngineCore.dll" (

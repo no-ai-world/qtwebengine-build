@@ -276,6 +276,31 @@ def check_run_py_args(root: Path) -> None:
 QTWE_DIR = "scripts/qtwebengine"
 
 
+def workflow_step_body(workflow: str, name_needle: str) -> str | None:
+    """取 workflow 里某个 step 的整段文本（`- name:` 到下一个 `- ` 之前）。
+
+    用于「这条守卫必须真的写在**这一步的执行体**里」这类判据：只按全文子串找的话，
+    把 `throw` 改成 `Write-Host`（或者把调用删掉、注释/报错的文案留着）检查照样通过——
+    这个坑在本文件里踩过两次，所以负向测试里专门有一条把 throw 换掉的变体。
+    """
+    lines = workflow.splitlines()
+    start = next(
+        (
+            i
+            for i, l in enumerate(lines)
+            if l.startswith("      - ") and name_needle in l
+        ),
+        None,
+    )
+    if start is None:
+        return None
+    end = next(
+        (j for j in range(start + 1, len(lines)) if lines[j].startswith("      - ")),
+        len(lines),
+    )
+    return "\n".join(lines[start:end])
+
+
 def workflow_invocations(workflow: str) -> set[str]:
     """workflow 里**真正被调用**的脚本体名（而不是被注释或报错文案提到的）。
 
@@ -412,7 +437,24 @@ def check_workflow(root: Path) -> None:
             "before build.cmd runs leaves no state file and looks like a time-out)",
         )
 
-    # 5. 真正的 YAML 解析（可选，本机可能没有 PyYAML）。
+    # 5. auto_continue 的失败必须发生在几秒钟内，而不是几小时之后。GITHUB_TOKEN 触发不了
+    #    新的 workflow 运行（平台限制），所以 auto_continue=true 没有 CACHE_TOKEN 时，
+    #    轮末那一步以前只打一行 Write-Host 就 exit 0 —— 静默降级成「编完不续跑」，而它恰好
+    #    发生在轮次被打断、最需要续跑的时刻。预检步必须真的 throw。
+    preflight = workflow_step_body(text, "auto_continue 需要 CACHE_TOKEN")
+    if preflight is None:
+        fail(
+            "workflow/loop",
+            "workflow 没有 auto_continue x CACHE_TOKEN 的预检步：秘密缺失只能在轮末才发现，"
+            "自动续跑会静默断链",
+        )
+    elif "throw" not in preflight:
+        fail(
+            "workflow/loop",
+            "auto_continue 的预检步不 throw：CACHE_TOKEN 缺失只会打一行日志，续跑照样静默断链",
+        )
+
+    # 6. 真正的 YAML 解析（可选，本机可能没有 PyYAML）。
     try:
         import yaml  # type: ignore
     except Exception:
@@ -473,11 +515,32 @@ def check_ccache_wiring(root: Path) -> None:
     # 2b. 退出码 3 是脚本自己的「你把命令行写错了」。它必须与 2 分开处理：2 =「判断不了」
     #     → build.cmd 打一句警告就放行整轮，所以一次参数写错要是也落进 2，这道门禁就被静默
     #     关掉了——而它存在的全部意义就是拦住这种事（历史上 -Wrapper 被丢过一次，白烧一轮）。
-    if 'if "%RC%"=="3"' not in build:
+    if 'if "%STEP_RC%"=="3"' not in build:
         fail(
             "ccache/wiring",
             "build.cmd 没有单独处理 check-ccache-bound.py 的用法错误退出码 3："
             "参数写错会被当成「判断不了」而放行，门禁静默失效",
+        )
+
+    # 2c. build.cmd 不能拿 RC 当自己的返回码变量。批处理的 `set` 导出的是**环境变量**，
+    #     子进程全都继承，而 CMake 把 $ENV{RC} 当成资源编译器的路径
+    #     （CMakeDetermineRCCompiler.cmake：`Could not find compiler set in environment
+    #     variable RC` → FATAL_ERROR → `CMAKE_RC_COMPILER not set, after EnableLanguage`）。
+    #     实测：configure 那一步的返回码 0 泄漏成 RC=0，check-ccache-bound.py 里的 cmake
+    #     就死在 GN 的 ExternalProject configure 上，GN 规则永远生成不出来，这道门禁每轮都
+    #     答「判断不了(2)」——门禁等于被静默关掉。换成一个没有工具会读的名字。
+    bad_rc = [
+        i
+        for i, l in enumerate(build.splitlines(), 1)
+        if re.match(r'\s*set\s+"RC=', l, re.IGNORECASE)
+    ]
+    if bad_rc:
+        fail(
+            "ccache/wiring",
+            "build.cmd 用 RC 当环境变量（行 "
+            + ", ".join(str(i) for i in bad_rc[:5])
+            + "）：CMake 会把 $ENV{RC} 当成资源编译器路径，check-ccache-bound.py 的 GN 生成"
+            "会失败并被降级成「判断不了」，缓存门禁静默失效；换一个不撞工具链的名字",
         )
 
     # 3. 看门狗是唯一能提前看到卡死的手段（runner 是一次性 VM，事后无从查证）。

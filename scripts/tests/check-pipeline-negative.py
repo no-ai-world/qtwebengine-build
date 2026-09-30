@@ -179,7 +179,14 @@ def main() -> int:
     expect(
         "build.cmd 不再单独处理退出码 3（参数写错会被当成「判断不了」而放行）",
         "退出码 3",
-        lambda r: edit_build_cmd(r, 'if "%RC%"=="3"', 'if "%RC%"=="9"'),
+        lambda r: edit_build_cmd(r, 'if "%STEP_RC%"=="3"', 'if "%STEP_RC%"=="9"'),
+    )
+    # 环境变量 RC 会撞上 CMake 的资源编译器：子进程继承它之后 GN 的 configure 直接失败，
+    # check-ccache-bound.py 只能答「判断不了」，门禁静默失效（真实踩过的那次就是这个）。
+    expect(
+        "build.cmd 又拿 RC 当环境变量（CMake 会当成资源编译器路径）",
+        "用 RC 当环境变量",
+        lambda r: edit_build_cmd(r, 'set "STEP_RC=%errorlevel%"', 'set "RC=%errorlevel%"'),
     )
     expect(
         "-LiteralPath 里写了通配符（不会被展开）",
@@ -189,6 +196,22 @@ def main() -> int:
             "          $ErrorActionPreference = 'Stop'\n",
             "          $ErrorActionPreference = 'Stop'\n"
             "          Copy-Item -LiteralPath (Join-Path $env:DIST_DIR '*') -Destination x -Force\n",
+        ),
+    )
+    # auto_continue 少了 CACHE_TOKEN 本来就是「轮末才知道」的失败，所以这条守卫要守住两件事：
+    # 预检步还在，而且它真的 throw（换成 Write-Host 就又变回静默断链了）。
+    expect(
+        "auto_continue 的预检步被删掉（秘密缺失时只能在轮末才发现）",
+        "的预检步",
+        lambda r: edit_workflow(r, "预检：auto_continue 需要 CACHE_TOKEN", "预检（已删除）"),
+    )
+    expect(
+        "auto_continue 的预检步不再 throw（只打日志，续跑静默断链）",
+        "预检步不 throw",
+        lambda r: edit_workflow(
+            r,
+            "throw 'auto_continue=true 但没有 CACHE_TOKEN",
+            "Write-Host 'auto_continue=true 但没有 CACHE_TOKEN",
         ),
     )
 
