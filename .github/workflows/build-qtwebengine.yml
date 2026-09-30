@@ -22,7 +22,7 @@
 #     1) 只编一个配置。VS 是多配置生成器，装了 Qt 之后 CMAKE_CONFIGURATION_TYPES 被
 #        强制设成 RelWithDebInfo;Debug；QtWebEngine 每个配置都接一棵 gn/ninja 树、
 #        互为 WebEngineCore 的依赖，于是两个配置都要编（实测：第一棵树 56 分钟编到
-#        8038/29705，第二棵排队等着）。patch-single-config.ps1 把配置集收成一个。
+#        8038/29705，第二棵排队等着）。patch-single-config.py 把配置集收成一个。
 #     2) build 阶段的时间预算给足（默认 300 分钟），因为打断了就没有第二次机会。
 #   轮次之间靠 STATE_FILE 区分三种结局：
 #     ok         = 编完了，继续 finish / 打包 / 验收
@@ -49,7 +49,7 @@
 #   * 编译成功（state=ok）后自动发 Release，标签 qtwebengine-<版本>-win64-msvc2022-codecs，
 #     同一版本再编成功会更新同一个 Release 并覆盖同名资产；
 #   * 本流水线只负责把它编出来并发布，不做产物生效性验证。
-#   * 打包：scripts/qtwebengine/stage-webengine-runtime.ps1 把安装前缀铺成待分发目录，
+#   * 打包：scripts/qtwebengine/stage-webengine-runtime.py 把安装前缀铺成待分发目录，
 #     归档步骤再把它压成 zip。
 # ============================================================================
 
@@ -86,7 +86,7 @@ on:
           - Debug
         default: 'RelWithDebInfo'
       use_ccache:
-        description: '开启 ccache（往 gn 注入 cc_wrapper，并由 patch-msvc-ccache.ps1 让 MSVC 工具链也认它）。分轮续跑的前提；不开则每轮从头编译'
+        description: '开启 ccache（往 gn 注入 cc_wrapper，并由 patch-msvc-ccache.py 让 MSVC 工具链也认它）。分轮续跑的前提；不开则每轮从头编译'
         type: boolean
         default: false
       cache_backend:
@@ -443,24 +443,30 @@ jobs:
           # 它每 5 分钟往同一份标准输出写一行：最后完成的目标、日志静默时长、可用内存、
           # cl/mspdbsrv 的进程数与占用、ccache 计数；同时另存一份 watch-roundN.log 进产物。
           # 它只观察，不杀构建。
-          $watchScript = Join-Path $env:GITHUB_WORKSPACE 'scripts\qtwebengine\watch-build.ps1'
+          $watchScript = Join-Path $env:GITHUB_WORKSPACE 'scripts\qtwebengine\watch-build.py'
           $watchOut = Join-Path $env:DIST_DIR "watch-round${{ inputs.round }}.log"
           $watch = $null
           if (Test-Path $watchScript) {
+            # -u 与脚本自己强制 UTF-8 + 行缓冲是双保险：这一步把标准输出接进管道，块缓冲
+            # 会让看门狗的行攒在缓冲区里，而它存在的全部意义就是「边跑边看得见」。
+            # 路径参数自己带上引号：Start-Process 的 -ArgumentList 只是用空格拼接数组，
+            # 不会替你加引号，而自托管 runner 的工作区路径可以带空格。
             # -BuildDir 让看门狗能直接读 GN 生成的 ninja 规则，判断 wrapper 有没有进编译器
             # 命令行（不依赖 CMake target 名字）；-AbortOnDeadCache 只在两个独立信号一致
             # ——规则里没有 wrapper，且 ccache 计数为 0——时才停掉编译器，把一轮五小时
             # 缩成几分钟，并且由 build.cmd 记成 failed 而不是超时。
-            $watchArgs = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $watchScript,
-                           '-LogFile', $log, '-OutFile', $watchOut, '-WorkRoot', $env:WORK_ROOT,
-                           '-BuildDir', $env:BUILD_DIR, '-BudgetMinutes', '${{ inputs.build_budget_minutes }}',
+            $pythonExe = (Get-Command python -ErrorAction Stop).Source
+            $watchArgs = @('-u', '-X', 'utf8', "`"$watchScript`"",
+                           '-LogFile', "`"$log`"", '-OutFile', "`"$watchOut`"",
+                           '-WorkRoot', "`"$env:WORK_ROOT`"", '-BuildDir', "`"$env:BUILD_DIR`"",
+                           '-BudgetMinutes', '${{ inputs.build_budget_minutes }}',
                            '-AbortOnDeadCache', '-Heartbeat')
             $ccacheExe = Join-Path $env:TOOLS_BIN 'ccache.exe'
-            if (Test-Path $ccacheExe) { $watchArgs += @('-CcacheExe', $ccacheExe) }
-            $watch = Start-Process -FilePath 'pwsh' -ArgumentList $watchArgs -NoNewWindow -PassThru
+            if (Test-Path $ccacheExe) { $watchArgs += @('-CcacheExe', "`"$ccacheExe`"") }
+            $watch = Start-Process -FilePath $pythonExe -ArgumentList $watchArgs -NoNewWindow -PassThru
             Write-Host "看门狗 pid=$($watch.Id)，输出：$watchOut"
           } else {
-            Write-Host '没有 watch-build.ps1，跳看看门狗'
+            Write-Host '没有 watch-build.py，跳看看门狗'
           }
           try {
             & cmd.exe /c "`"$script`" build 2>&1" | Tee-Object -FilePath $log
@@ -506,7 +512,7 @@ jobs:
           Write-Host "ccache: $cacheable"
           if ($cacheable -and $cacheable -match ':\s*(\d+)') {
             if ([int]$Matches[1] -eq 0) {
-              throw 'ccache 一次都没被调用：cc_wrapper 没绑定，下一轮不会有任何进展。先看 build 日志开头的 [ccache-bound] 与 [watch] 行，再检查 scripts/qtwebengine/patch-msvc-ccache.ps1（MSVC 工具链只对 clang 拼 cc_wrapper）与 patch-gn-args.ps1（args.gn 注入）。'
+              throw 'ccache 一次都没被调用：cc_wrapper 没绑定，下一轮不会有任何进展。先看 build 日志开头的 [ccache-bound] 与 [watch] 行，再检查 scripts/qtwebengine/patch-msvc-ccache.py（MSVC 工具链只对 clang 拼 cc_wrapper）与 patch-gn-args.py（args.gn 注入）。'
             }
           } else {
             Write-Warning '没解析到 Cacheable calls，按 stats 输出人工核对'

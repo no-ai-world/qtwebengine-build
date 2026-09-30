@@ -223,7 +223,9 @@ def check_build_cmd(root: Path) -> None:
     #     于是整个 Chromium 编两遍（实测第一棵树 56 分钟编到 8038/29705，第二棵排队）。
     if 'if /i not "%CFG_LINE%"=="%BUILD_TYPE%" goto :assert_config_multi' not in text:
         fail("build.cmd/config", ":assert_config does not require exactly one configuration")
-    if "patch-single-config.ps1" not in text:
+    # 注意这里匹配的是**调用**而不是脚本名：build.cmd 里别处（注释、:assert_config 的
+    # 报错文案）也会提到这个文件名，只按子串找的话，把调用删掉、注释留着，检查照样通过。
+    if "call :run_py patch-single-config.py" not in text:
         fail("build.cmd/config", "the single-config patch is never applied")
     if "-DQTWE_BUILD_CONFIGURATION=%BUILD_TYPE%" not in text:
         fail(
@@ -234,18 +236,20 @@ def check_build_cmd(root: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
-# :run_ps 参数计数
+# :run_py 参数计数
 # ---------------------------------------------------------------------------
 
-RUN_PS_RE = re.compile(r"call\s+:run_ps\s+(\S+)(.*)$", re.IGNORECASE)
-RUN_PS_ARG_RE = re.compile(r'"[^"]*"|\S+')
-# build.cmd 的 :run_ps 只转发 %2..%9，也就是脚本名之后最多 8 个参数。第 9 个会被无声
+RUN_PY_RE = re.compile(r"call\s+:run_py\s+(\S+)(.*)$", re.IGNORECASE)
+RUN_PY_ARG_RE = re.compile(r'"[^"]*"|\S+')
+# build.cmd 的 :run_py 只转发 %2..%9，也就是脚本名之后最多 8 个参数。第 9 个会被无声
 # 丢掉，而丢掉一个开关的值会让脚本报「参数缺值」——看起来就像它要检查的那件事失败了。
 # 这不是理论：check-ccache-bound.ps1 -Wrapper "ccache" 就是这么被丢的，白烧一轮。
-RUN_PS_MAX_ARGS = 8
+# 换成 Python 并不会让这个上限消失：在 call 出来的标签里，%* 属于外层那次调用，所以
+# 批处理语言本身就没法转发不定个数的参数。
+RUN_PY_MAX_ARGS = 8
 
 
-def check_run_ps_args(root: Path) -> None:
+def check_run_py_args(root: Path) -> None:
     path = root / BUILD_CMD
     if not path.is_file():
         return
@@ -253,15 +257,81 @@ def check_run_ps_args(root: Path) -> None:
         s = line.strip()
         if s.lower().startswith("rem"):
             continue
-        m = RUN_PS_RE.search(s)
+        m = RUN_PY_RE.search(s)
         if not m:
             continue
-        args = RUN_PS_ARG_RE.findall(m.group(2))
-        if len(args) > RUN_PS_MAX_ARGS:
+        args = RUN_PY_ARG_RE.findall(m.group(2))
+        if len(args) > RUN_PY_MAX_ARGS:
             fail(
-                "build.cmd/run_ps",
-                f"line {i}: {m.group(1)} is called with {len(args)} arguments, but :run_ps "
-                f"forwards only {RUN_PS_MAX_ARGS} (%2..%9); the extras are dropped silently",
+                "build.cmd/run_py",
+                f"line {i}: {m.group(1)} is called with {len(args)} arguments, but :run_py "
+                f"forwards only {RUN_PY_MAX_ARGS} (%2..%9); the extras are dropped silently",
+            )
+
+
+# ---------------------------------------------------------------------------
+# 迁移完整性：脚本已经没有 PowerShell 了，别让任何一处悄悄退回去
+# ---------------------------------------------------------------------------
+
+QTWE_DIR = "scripts/qtwebengine"
+
+
+def workflow_invocations(workflow: str) -> set[str]:
+    """workflow 里**真正被调用**的脚本体名（而不是被注释或报错文案提到的）。
+
+    判据：出现在非注释行上，且那一行同时提到 Join-Path 或 python——workflow 启动脚本的方式
+    就是「Join-Path 拼出路径 + 交给 python」。只按子串找的话，`Write-Host '没有 watch-build.py'`
+    这种文案会把检查自己满足掉（而把启动那一行删掉反而看不出来）。
+    """
+    found: set[str] = set()
+    for line in workflow.splitlines():
+        if line.lstrip().startswith("#"):
+            continue
+        if "Join-Path" not in line and "python" not in line:
+            continue
+        found.update(m.group(0) for m in re.finditer(r"[\w.-]+\.py\b", line))
+    return found
+
+
+def check_no_powershell_scripts(root: Path) -> None:
+    """scripts/ 下不该再有 .ps1，调用方也不该再指向 .ps1。
+
+    这不是洁癖：整次迁移的收益就是「批处理的 ASCII/CRLF/goto/参数上限 + PowerShell 的
+    5.1/7 差异、-LiteralPath、CIM」这几类坑一次性消失。留下一个 .ps1 就等于把那一整类
+    不确定性留在流水线里，而它只会在某次 CI 跑到一半时表现成另一个样子。
+    """
+    leftovers = sorted(p.relative_to(root).as_posix() for p in (root / "scripts").rglob("*.ps1"))
+    if leftovers:
+        fail("migration/powershell", f"scripts/ 下仍有 PowerShell 脚本：{leftovers}")
+
+    for rel in (BUILD_CMD, WORKFLOW):
+        path = root / rel
+        if not path.is_file():
+            continue
+        for i, line in enumerate(read_text(path).splitlines(), 1):
+            if ".ps1" in line:
+                fail(
+                    "migration/powershell",
+                    f"{rel}:{i}: 仍然引用 .ps1：{line.strip()[:90]}",
+                )
+
+    # 反向：scripts/qtwebengine 下的每个 Python 脚本都得**被调用**，否则就是死代码
+    # （一个没人调的补丁脚本比没有更糟：它让人以为那件事已经做了）。
+    #
+    # 判据必须是「调用」而不是「提到」：build.cmd 的注释与 echo 报错文案、以及 workflow 头部
+    # 的说明里都写着脚本名，按子串找的话，把调用整行删掉、注释留着，这条检查照样通过。
+    # 实测过：删掉 `call :run_py stage-webengine-runtime.py`（打包那一步）时就是这个结果。
+    build = read_text(root / BUILD_CMD) if (root / BUILD_CMD).is_file() else ""
+    workflow = read_text(root / WORKFLOW) if (root / WORKFLOW).is_file() else ""
+    workflow_called = workflow_invocations(workflow)
+    for path in sorted((root / QTWE_DIR).glob("*.py")):
+        invoked_in_build = f"call :run_py {path.name}" in build
+        invoked_in_workflow = path.name in workflow_called
+        if not (invoked_in_build or invoked_in_workflow):
+            fail(
+                "migration/orphan",
+                f"{QTWE_DIR}/{path.name} 没有被 build.cmd 的 call :run_py 或 workflow 的"
+                "非注释行实际调用（死代码？）",
             )
 
 
@@ -359,9 +429,9 @@ def check_workflow(root: Path) -> None:
 # 悄悄变成「下一轮从头再来」，而一轮就是五个小时
 # ---------------------------------------------------------------------------
 
-PATCH_MSVC_CCACHE = "scripts/qtwebengine/patch-msvc-ccache.ps1"
-CHECK_CCACHE_BOUND = "scripts/qtwebengine/check-ccache-bound.ps1"
-WATCH_BUILD = "scripts/qtwebengine/watch-build.ps1"
+PATCH_MSVC_CCACHE = "scripts/qtwebengine/patch-msvc-ccache.py"
+CHECK_CCACHE_BOUND = "scripts/qtwebengine/check-ccache-bound.py"
+WATCH_BUILD = "scripts/qtwebengine/watch-build.py"
 
 
 def check_ccache_wiring(root: Path) -> None:
@@ -372,10 +442,10 @@ def check_ccache_wiring(root: Path) -> None:
     #    （chromium/build/toolchain/win/toolchain.gni），而 Qt 的 MSVC 版 QtWebEngine
     #    是 is_clang=false：没有这个补丁，args.gn 里的 cc_wrapper 被整体丢掉，ccache
     #    一次都不会被调用（实测：编到 [8038/29705]，缓存 391 字节，没有 Cacheable calls）。
-    if "call :run_ps patch-msvc-ccache.ps1" not in build:
+    if "call :run_py patch-msvc-ccache.py" not in build:
         fail(
             "ccache/wiring",
-            "build.cmd 没有调用 patch-msvc-ccache.ps1：MSVC 下注入的 cc_wrapper 会被忽略，"
+            "build.cmd 没有调用 patch-msvc-ccache.py：MSVC 下注入的 cc_wrapper 会被忽略，"
             "ccache 永远不会被调用",
         )
     patch = root / PATCH_MSVC_CCACHE
@@ -392,30 +462,46 @@ def check_ccache_wiring(root: Path) -> None:
                 fail("ccache/wiring", f"{PATCH_MSVC_CCACHE} 丢了{why}：{needle}")
 
     # 2. 绑定关系必须在五小时的构建之前证明，而不是构建之后才知道。
-    if "call :run_ps check-ccache-bound.ps1" not in build:
+    if "call :run_py check-ccache-bound.py" not in build:
         fail(
             "ccache/wiring",
-            "build.cmd 没有跑 check-ccache-bound.ps1：缓存没接上这件事只能在一整轮白编之后才发现",
+            "build.cmd 没有跑 check-ccache-bound.py：缓存没接上这件事只能在一整轮白编之后才发现",
         )
     if not (root / CHECK_CCACHE_BOUND).is_file():
         fail("ccache/wiring", f"缺少 {CHECK_CCACHE_BOUND}")
 
+    # 2b. 退出码 3 是脚本自己的「你把命令行写错了」。它必须与 2 分开处理：2 =「判断不了」
+    #     → build.cmd 打一句警告就放行整轮，所以一次参数写错要是也落进 2，这道门禁就被静默
+    #     关掉了——而它存在的全部意义就是拦住这种事（历史上 -Wrapper 被丢过一次，白烧一轮）。
+    if 'if "%RC%"=="3"' not in build:
+        fail(
+            "ccache/wiring",
+            "build.cmd 没有单独处理 check-ccache-bound.py 的用法错误退出码 3："
+            "参数写错会被当成「判断不了」而放行，门禁静默失效",
+        )
+
     # 3. 看门狗是唯一能提前看到卡死的手段（runner 是一次性 VM，事后无从查证）。
-    if "watch-build.ps1" not in workflow:
-        fail("ccache/wiring", "workflow 没有启动 watch-build.ps1：卡死之后又只能靠猜")
+    #    判据同 workflow_invocations：要的是真的被启动，不是文案里提了一句。
+    if "watch-build.py" not in workflow_invocations(workflow):
+        fail("ccache/wiring", "workflow 没有启动 watch-build.py：卡死之后又只能靠猜")
     if not (root / WATCH_BUILD).is_file():
         fail("ccache/wiring", f"缺少 {WATCH_BUILD}")
     # 它还得拿到判断依据：ninja 规则所在目录、时间预算，以及允许在死缓存上停手。
-    for needle, why in (
-        ("'-BuildDir', $env:BUILD_DIR", "看门狗拿不到构建目录，就没法判断 wrapper 有没有进 ninja 规则"),
-        ("'-AbortOnDeadCache'", "看门狗不能在「缓存肯定没有、且这一轮编不完」时停手"),
-        ("'-BudgetMinutes'", "看门狗不知道时间预算，就无法判断这一轮还编不编得完"),
-        ("'-Heartbeat'", "看门狗不发心跳：作业日志在 in_progress 时拿不到，这一轮就只能事后看"),
-        ("GH_TOKEN: ${{ github.token }}", "构建步没把 token 交给看门狗，心跳发不出去"),
-        ("checks: write", "workflow 没有 checks:write 权限，心跳写不进 check run"),
+    # 第一项允许两种写法：-BuildDir 的值自己带引号（自托管 runner 的工作区路径可以带空格），
+    # 也可以不带（Start-Process 的 -ArgumentList 只是用空格拼接数组）。两种都算接上了。
+    for needles, why in (
+        (
+            ("'-BuildDir', \"`\"$env:BUILD_DIR`\"\"", "'-BuildDir', $env:BUILD_DIR"),
+            "看门狗拿不到构建目录，就没法判断 wrapper 有没有进 ninja 规则",
+        ),
+        (("'-AbortOnDeadCache'",), "看门狗不能在「缓存肯定没有、且这一轮编不完」时停手"),
+        (("'-BudgetMinutes'",), "看门狗不知道时间预算，就无法判断这一轮还编不编得完"),
+        (("'-Heartbeat'",), "看门狗不发心跳：作业日志在 in_progress 时拿不到，这一轮就只能事后看"),
+        (("GH_TOKEN: ${{ github.token }}",), "构建步没把 token 交给看门狗，心跳发不出去"),
+        (("checks: write",), "workflow 没有 checks:write 权限，心跳写不进 check run"),
     ):
-        if needle not in workflow:
-            fail("ccache/wiring", f"{why}（缺 {needle}）")
+        if not any(needle in workflow for needle in needles):
+            fail("ccache/wiring", f"{why}（缺 {' 或 '.join(needles)}）")
 
     # 4. ninja 自己的默认并行度是 cores+2；在 4 核/16 GB 的 runner 上，这个数字就是
     #    决定「换页卡死」还是「编完」的内存上限。
@@ -441,24 +527,51 @@ def check_ccache_wiring(root: Path) -> None:
 
     # 6. symbol_level 旋钮要真的接到 build.cmd 上（Qt 在 RelWithDebInfo+MSVC 下写 2）。
     if "SYMBOL_LEVEL:" not in workflow or "-SymbolLevel" not in build:
-        fail("ccache/wiring", "symbol_level 输入没有接到 patch-gn-args.ps1 -SymbolLevel 上")
+        fail("ccache/wiring", "symbol_level 输入没有接到 patch-gn-args.py -SymbolLevel 上")
+
+    # 7. :run_py 的调用行必须真的用 -u 与 -X utf8。CI 把这一步的标准输出接进管道，Python
+    #    于是块缓冲，看门狗要读的那份日志就会几分钟没有新行——正是它被造出来要发现的那种
+    #    症状；而没有 -X utf8，重定向下的标准输出会退回 OEM 代码页，脚本里的中文日志直接
+    #    抛 UnicodeEncodeError，整步非零退出。脚本自己也会强制 UTF-8 + 行缓冲（第二道），
+    #    但调用点这一处不能少：它同时管住了 cmake/gh 这些子进程的输出时序。
+    #    必须看**调用行本身**：上面那段理由注释里就写着 "-u" 和 "-X utf8"，按子串搜全文的话，
+    #    把开关从调用行删掉、注释留着，检查照样通过（这个坑在本文件里已经踩过两次）。
+    invocation = next(
+        (line.strip() for line in build.splitlines() if line.strip().startswith("python ")),
+        "",
+    )
+    if not invocation:
+        fail("ccache/wiring", "build.cmd 里找不到 :run_py 的 python 调用行")
+    else:
+        for needle, why in (
+            ("-u ", "没有加 -u：重定向输出时 Python 块缓冲，构建日志会几分钟不出一行，看门狗的进度与静默判定全部失准"),
+            ("-X utf8", "没有加 -X utf8：管道下标准输出退回 OEM 代码页，脚本里的中文日志会抛 UnicodeEncodeError"),
+            ('"%SCRIPT_DIR%\\%~1"', "脚本路径没有加引号：SCRIPT_DIR 可以带空格（自托管 runner 就是），裸路径会被拆成两个参数"),
+        ):
+            if needle not in invocation:
+                fail("ccache/wiring", f"build.cmd 的 :run_py {why}（{invocation[:80]}）")
 
 
 # ---------------------------------------------------------------------------
-# PowerShell：-LiteralPath 不做通配展开
+# 剩下的 PowerShell：workflow 里那十几段内联脚本。迁移之后 .ps1 文件已经没有了，
+# 但 `shell: pwsh` 的步骤还在（预检/页面文件/ccache/Qt 安装/判定/归档/汇总/续跑），
+# 所以这一类坑仍然要守着。
 # ---------------------------------------------------------------------------
 
 LITERALPATH_RE = re.compile('-LiteralPath\\s+([^\\r\\n]*?)(?=\\s+-[A-Za-z]|$)')
 
 
-def check_literalpath_wildcards(root: Path) -> None:
+def check_inline_powershell_literalpath(root: Path) -> None:
     """-LiteralPath 下的星号不是通配符，是字面量字符。
 
     `Copy-Item -LiteralPath (Join-Path $dir '*') -Destination ...` 不做展开，直接报
-    "Cannot find path ...*"；由于脚本是 $ErrorActionPreference='Stop'，收尾阶段（安装后
-    打包暂存树）会整段中止。这条路径只有在构建成功那一轮才会跑到，所以这个错误本来要等到
-    一轮十五小时的战役最后一步才暴露——本地拿假安装树跑一次就抓到了。 -Filter 通配是正常的，
-    不在检查范围内（值出现在 -Filter 之后，不在 -LiteralPath 的取值里）。
+    "Cannot find path ...*"；而 workflow 步骤带 $ErrorActionPreference='Stop'，收尾阶段
+    （安装后打包暂存树）会整段中止。这条路径只有在构建成功那一轮才会跑到，所以这个错误本来
+    要等到一轮十五小时的战役最后一步才暴露——本地拿假安装树跑一次就抓到了。
+    -Filter 通配是正常的，不在检查范围内（值出现在 -Filter 之后，不在 -LiteralPath 的取值里）。
+
+    扫描范围是 workflow（内联 PowerShell 唯一的容身处）加上任何还在的 .ps1：后者正常情况
+    下为空，由 check_no_powershell_scripts 另行报告。
     """
     targets = sorted((root / "scripts").rglob("*.ps1")) + [root / WORKFLOW]
     for path in targets:
@@ -502,8 +615,9 @@ def main() -> int:
     check_build_cmd(root)
     check_workflow(root)
     check_ccache_wiring(root)
-    check_run_ps_args(root)
-    check_literalpath_wildcards(root)
+    check_run_py_args(root)
+    check_no_powershell_scripts(root)
+    check_inline_powershell_literalpath(root)
     check_tools_compile(root)
 
     for n in notes:

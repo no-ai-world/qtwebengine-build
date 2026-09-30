@@ -235,22 +235,30 @@ rem ---------------------------------------------------------------------------
 rem helpers
 rem ---------------------------------------------------------------------------
 
-rem Run a sibling PowerShell script with whichever PowerShell is available.
-rem pwsh is preferred; Windows PowerShell 5.1 is trimmed out of some images.
-:run_ps
+rem Run a sibling Python script. Python is already a build dependency here:
+rem :check_tools requires it on PATH, and Chromium's own build needs it.
+rem
+rem -u is not cosmetic. With stdout redirected - and the CI step pipes everything
+rem through Tee-Object - Python block-buffers, so a script's output arrives in
+rem bursts minutes late. The build log is read while it is still being written:
+rem the watchdog takes the ninja counter and the silence time from it, and the
+rem "GN generation" line has to show up before the four minutes it announces.
+rem The scripts also force UTF-8 line-buffered stdout themselves, so this is the
+rem outer of two guards, not the only one. -X utf8 keeps the same promise for the
+rem text they open themselves, and stops the Chinese log lines from dying with
+rem UnicodeEncodeError under an OEM code page.
+:run_py
 rem A ninth argument would be dropped silently (only %2..%9 are forwarded), and a
 rem dropped switch value makes the script fail with a parameter error that looks
 rem like the failure it was checking for. Say so instead of losing a round.
-if not "%~9"=="" echo [warn] :run_ps received more than 8 arguments; the extras are ignored: %~9
-set "PS_EXE=powershell"
-where pwsh >nul 2>nul
-if not errorlevel 1 set "PS_EXE=pwsh"
-rem Up to eight arguments after the script name (%2..%9). The limit is not
-rem cosmetic: a ninth argument is dropped without a word, and a dropped switch
-rem value makes the script fail with a parameter error that looks like the
-rem thing it was checking for. check-pipeline.py counts the arguments at every
-rem call site, because this cost a round once (check-ccache-bound.ps1 -Wrapper).
-%PS_EXE% -NoProfile -ExecutionPolicy Bypass -File "%SCRIPT_DIR%\%~1" %2 %3 %4 %5 %6 %7 %8 %9
+if not "%~9"=="" echo [warn] :run_py received more than 8 arguments; the extras are ignored: %~9
+rem Up to eight arguments after the script name (%2..%9), the same limit the batch
+rem language itself imposes: inside a called label %* belongs to the outer
+rem invocation, so it cannot forward a variable number. A dropped switch value
+rem makes the script fail with an argument error that looks like the very thing it
+rem was checking for. check-pipeline.py counts the arguments at every call site,
+rem because this cost a round once (check-ccache-bound.py -Wrapper).
+python -u -X utf8 "%SCRIPT_DIR%\%~1" %2 %3 %4 %5 %6 %7 %8 %9
 exit /b %errorlevel%
 
 :defaults
@@ -494,7 +502,7 @@ if not "%USE_CCACHE%"=="1" exit /b 0
 echo [step] ccache statistics after this build:
 call ccache --show-stats
 rem A Cacheable calls counter above zero is the proof that the injected
-rem cc_wrapper gn arg actually bound - see patch-gn-args.ps1. Zero (or a counter
+rem cc_wrapper gn arg actually bound - see patch-gn-args.py. Zero (or a counter
 rem that cannot be read) means the next round gains nothing, which is worth
 rem shouting about rather than burning hours on. This is only a warning here:
 rem the build itself succeeded, so it must not turn the phase into a failure.
@@ -553,23 +561,23 @@ if "%SKIP_PATCH%"=="1" (
     exit /b 0
 )
 echo [step] patch 1/4: Chromium cppgc - MSVC 14.44 reports C2352 on Qt 6.8.3 V8
-call :run_ps patch-cppgc.ps1 -SourceRoot "%SRC_DIR%"
+call :run_py patch-cppgc.py -SourceRoot "%SRC_DIR%"
 if errorlevel 1 (
     echo [error] cppgc patch failed
     exit /b 1
 )
 echo [step] patch 2/4: single configuration - a multi-config generator would build RelWithDebInfo and Debug
-call :run_ps patch-single-config.ps1 -SourceRoot "%SRC_DIR%"
+call :run_py patch-single-config.py -SourceRoot "%SRC_DIR%"
 if errorlevel 1 (
     echo [error] single-config patch failed
     exit /b 1
 )
 if "%USE_CCACHE%"=="1" (
     echo [step] patch 3/4: gn symbol_level=%SYMBOL_LEVEL% and cc_wrapper=ccache into src/core/CMakeLists.txt
-    call :run_ps patch-gn-args.ps1 -SourceRoot "%SRC_DIR%" -SymbolLevel "%SYMBOL_LEVEL%" -UseCcache
+    call :run_py patch-gn-args.py -SourceRoot "%SRC_DIR%" -SymbolLevel "%SYMBOL_LEVEL%" -UseCcache
 ) else (
     echo [step] patch 3/4: gn symbol_level=%SYMBOL_LEVEL%, clearing any injected cc_wrapper
-    call :run_ps patch-gn-args.ps1 -SourceRoot "%SRC_DIR%" -SymbolLevel "%SYMBOL_LEVEL%"
+    call :run_py patch-gn-args.py -SourceRoot "%SRC_DIR%" -SymbolLevel "%SYMBOL_LEVEL%"
 )
 if errorlevel 1 (
     echo [error] gn args patch failed
@@ -581,7 +589,7 @@ rem is_clang=false. It is inert when USE_CCACHE=0, because nothing injects cc_wr
 rem then, so leaving it applied across phases is harmless.
 if "%USE_CCACHE%"=="1" (
     echo [step] patch 4/4: MSVC toolchain honours cc_wrapper - Chromium only wires it for clang
-    call :run_ps patch-msvc-ccache.ps1 -SourceRoot "%SRC_DIR%"
+    call :run_py patch-msvc-ccache.py -SourceRoot "%SRC_DIR%"
     if errorlevel 1 (
         echo [error] MSVC cc_wrapper patch failed; the cache would never be called
         exit /b 1
@@ -647,7 +655,7 @@ rem were ever missing again, configure fails here in the prepare step instead of
 rem producing a runtime without WebChannel five hours later.
 rem How to tell it took effect, on the produced DLL: the string "without webchannel support"
 rem must be ABSENT (it is present in the pre-fix artifact), and an end-to-end probe must round
-rem trip JS -> Python slot over qt.webChannelTransport (.temp/probe-webchannel3.py).
+rem trip a JS -> Python slot call over qt.webChannelTransport.
 set "RC=%errorlevel%"
 popd
 if not "%RC%"=="0" (
@@ -695,7 +703,7 @@ rem configuration in this list, and QtWebEngine wires one gn/ninja tree per entr
 rem each one a dependency of WebEngineCore - so two entries compile the whole of
 rem Chromium twice (measured: the first tree reached 8038/29705 in 56 minutes with the
 rem second queued behind it). That runtime is never used: only the requested
-rem configuration is installed. patch-single-config.ps1 narrows the list; if it did not
+rem configuration is installed. patch-single-config.py narrows the list; if it did not
 rem take effect, fail here in seconds instead of after hours.
 if /i not "%CFG_LINE%"=="%BUILD_TYPE%" goto :assert_config_multi
 rem Debug output carries CMAKE_DEBUG_POSTFIX, so its DLLs cannot be laid over PySide6.
@@ -726,7 +734,7 @@ echo [error] CMAKE_CONFIGURATION_TYPES is "%CFG_LINE%" but must be exactly "%BUI
 echo [error] a multi-config generator builds every configuration in that list, and
 echo [error] QtWebEngine wires one gn/ninja tree per entry, each a dependency of
 echo [error] WebEngineCore, so two entries compile the whole of Chromium twice
-echo [error] patch-single-config.ps1 must inject a CMAKE_CONFIGURATION_TYPES FORCE set
+echo [error] patch-single-config.py must inject a CMAKE_CONFIGURATION_TYPES FORCE set
 echo [error] after the Qt6 find_package in "%SRC_DIR%\CMakeLists.txt", and configure
 echo [error] must receive -DQTWE_BUILD_CONFIGURATION=%BUILD_TYPE%
 echo [error] delete "%BUILD_DIR%" and run the prepare phase again
@@ -741,7 +749,7 @@ exit /b 1
 rem The build phase costs five hours; a cache that never binds throws all of them away,
 rem and that is not hypothetical: with cc_wrapper injected but dropped by the MSVC
 rem toolchain, a round compiled [8038/29705] targets into a 391-byte cache and
-rem `ccache --show-stats` never saw a single call. check-ccache-bound.ps1 runs the GN
+rem `ccache --show-stats` never saw a single call. check-ccache-bound.py runs the GN
 rem generation (about four minutes - the build phase then finds it up to date) and
 rem reads the ninja rules GN wrote: they must name the wrapper. Exit code 2 from the
 rem script means "could not generate / could not tell", which is only a warning: the
@@ -751,16 +759,25 @@ if "%SKIP_PATCH%"=="1" (
     echo [warn] SKIP_PATCH=1: cannot verify that cc_wrapper reached the MSVC toolchain
     exit /b 0
 )
-call :run_ps check-ccache-bound.ps1 -BuildDir "%BUILD_DIR%" -BuildType "%BUILD_TYPE%" -Wrapper "ccache"
+call :run_py check-ccache-bound.py -BuildDir "%BUILD_DIR%" -BuildType "%BUILD_TYPE%" -Wrapper "ccache"
 set "RC=%errorlevel%"
 if "%RC%"=="0" exit /b 0
 if "%RC%"=="2" (
     echo [warn] could not verify the ccache binding before the build; see the log above
     exit /b 0
 )
+rem 3 is the script's "you called me wrong" code. It must not be folded into 2 (which means
+rem "could not tell" and lets the round continue): a mistyped flag would then silently disable
+rem the cache gate, which is the one thing this step exists to prevent. Say what it is instead
+rem of blaming the source tree. (The script keeps 2 for its own verdict on purpose.)
+if "%RC%"=="3" (
+    echo [error] check-ccache-bound.py rejected its own command line ^(exit 3^)
+    echo [error] the ccache binding was NOT verified; fix the call site above
+    exit /b 1
+)
 echo [error] cc_wrapper did not reach the compiler command line in the generated ninja rules
 echo [error] ccache would never be called and the whole build would be thrown away
-echo [error] check patch-msvc-ccache.ps1 and patch-gn-args.ps1 against this source tree
+echo [error] check patch-msvc-ccache.py and patch-gn-args.py against this source tree
 exit /b 1
 
 :build
@@ -831,7 +848,7 @@ exit /b 0
 
 :package
 echo [step] staging built runtime into %DIST_DIR%\qtwebengine-%QT_VERSION%-win64-msvc2022
-call :run_ps stage-webengine-runtime.ps1 -Source "%INSTALL_PREFIX%" -Destination "%DIST_DIR%\qtwebengine-%QT_VERSION%-win64-msvc2022" -Create
+call :run_py stage-webengine-runtime.py -Source "%INSTALL_PREFIX%" -Destination "%DIST_DIR%\qtwebengine-%QT_VERSION%-win64-msvc2022" -Create
 if errorlevel 1 (
     echo [error] packaging failed
     exit /b 1
