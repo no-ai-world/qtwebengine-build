@@ -21,7 +21,7 @@
 
 ## 余量：pdfium 不在缓存范围内
 
-`patch-gn-args.ps1` 只改 QtWebEngine 自己的 `src/core/CMakeLists.txt`，所以 `src/pdf`
+`patch-gn-args.py` 只改 QtWebEngine 自己的 `src/core/CMakeLists.txt`，所以 `src/pdf`
 那棵树不参与缓存；它的目标数不多。
 
 ## 自动续跑
@@ -34,7 +34,7 @@
 - **prepare 阶段**会跑一次 GN 生成并读 GN 写出的 ninja 规则，确认里面出现 `ccache`；
   没出现就当场失败（prepare 退出码 4），不会等到几小时后才发现缓存是空的。
   这一步同时让构建阶段省掉 GN 生成（约四分钟）。
-- **构建阶段**的 `watch-build.ps1` 每 5 分钟往日志写一行：最后完成的目标、日志静默多久、
+- **构建阶段**的 `watch-build.py` 每 5 分钟往日志写一行：最后完成的目标、日志静默多久、
   可用内存、`cl`/`mspdbsrv` 的进程数与占用、ccache 计数，另存 `watch-roundN.log` 进产物。
   它在两个独立信号一致（规则里没有 wrapper **且** ccache 计数为 0）时才会中止编译，
   把 `ccache-not-bound` 落盘成本轮的 `failed`。

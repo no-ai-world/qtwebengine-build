@@ -6,3 +6,7 @@
 # shell 脚本必须 LF：本机（Windows）core.autocrlf=true 会把 LF 转成 CRLF，
 # shebang 带上  之后 bash 会报 "bad interpreter: No such file or directory"
 *.sh text eol=lf
+# Python 脚本同样统一 LF（迁移前它们就是这么存的）：每个脚本都带 shebang，行尾一旦在
+# 本机与 CI 之间漂移，在 WSL / Git Bash 下跑就会撞上同一个 "bad interpreter"；
+# 而且改一个字节的 diff 会因为行尾不同而整份变红。
+*.py text eol=lf

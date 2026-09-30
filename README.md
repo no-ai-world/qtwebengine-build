@@ -43,15 +43,18 @@ translations\   →  <site-packages>\PySide6\translations\
 .github/workflows/build-qtwebengine.yml   流水线（准备 → 构建 → 打包 → 发布）
 docs/                                     说明文档，见下
 scripts/check-pipeline.py                 派 CI 之前的静态自检（不编译、不联网）
+scripts/tests/
+  check-pipeline-negative.py              负向测试：每条静态检查都要能被真的破坏掉
+  run-py-integration.py                   build.cmd 的 :run_py 机制集成测试（不需要 Qt/MSVC）
 scripts/qtwebengine/
   build.cmd                                构建驱动：环境→源码→补丁→configure→编译→安装→打包
-  patch-cppgc.ps1                          Chromium v8/cppgc 补丁（MSVC 14.44 的 C2352）
-  patch-gn-args.ps1                        注入 gn 参数（symbol_level、cc_wrapper）
-  patch-single-config.ps1                  把 CMAKE_CONFIGURATION_TYPES 收成一个配置（否则编两遍）
-  patch-msvc-ccache.ps1                    让 cc_wrapper 对 MSVC 工具链也生效（ccache 真被调用的前提）
-  check-ccache-bound.ps1                   prepare 阶段就证明缓存已接线（跑 GN 生成 + 读 ninja 规则）
-  watch-build.ps1                          构建阶段看门狗（进度/静默/内存/缓存接线 + check run 心跳）
-  stage-webengine-runtime.ps1              打包：把安装前缀铺成待分发目录（zip 的来源）
+  patch-cppgc.py                           Chromium v8/cppgc 补丁（MSVC 14.44 的 C2352）
+  patch-gn-args.py                         注入 gn 参数（symbol_level、cc_wrapper）
+  patch-single-config.py                   把 CMAKE_CONFIGURATION_TYPES 收成一个配置（否则编两遍）
+  patch-msvc-ccache.py                     让 cc_wrapper 对 MSVC 工具链也生效（ccache 真被调用的前提）
+  check-ccache-bound.py                    prepare 阶段就证明缓存已接线（跑 GN 生成 + 读 ninja 规则）
+  watch-build.py                           构建阶段看门狗（进度/静默/内存/缓存接线 + check run 心跳）
+  stage-webengine-runtime.py               打包：把安装前缀铺成待分发目录（zip 的来源）
 ```
 
 ## 文档
@@ -59,3 +62,4 @@ scripts/qtwebengine/
 - [运行与参数](docs/run.md) —— 怎么派一轮、全部输入与默认值、时间预算与三种结局、本地直接跑
 - [缓存与分轮续跑](docs/cache.md) —— 缓存后端、回写时机、自动续跑、怎么看进度
 - [产物与发布](docs/artifacts.md) —— 产物构成、Release 语义、铺进 PySide6
+- [脚本契约](docs/scripts.md) —— 各脚本职责与退出码、`check-ccache-bound` 的 0/1/2/3、刻意保留的行为差异

@@ -54,7 +54,9 @@ gh workflow run build-qtwebengine.yml --repo <owner>/qtwebengine-build \
 
 ## 本地直接跑
 
-CI 只是编排，所有步骤都在 `build.cmd` 里，本地同样能跑：
+CI 只是编排，所有步骤都在 `build.cmd` 里，本地同样能跑。`build.cmd` 会调
+`scripts\qtwebengine\` 下的 Python 脚本（补丁、缓存接线自检、打包），所以 `python` 必须在
+PATH 上——这本来就是构建依赖，Chromium 自己的构建也要它，`:check_tools` 会查：
 
 ```cmd
 set "QT_PATH=C:\Qt\6.8.3\msvc2022_64"        & rem 需要装了 msvc2022_64 全量包（含私有头文件）
@@ -73,4 +75,8 @@ python scripts/check-pipeline.py
 
 只做静态检查，不编译、不联网：批处理的 CRLF/ASCII、`goto`/`call` 标签是否存在、块括号是否配平、
 `cmake --build`/`--install` 是否带 `--config`、确定性失败有没有落盘成 `failed`（漏了会被误判成
-超时并无限续跑）、workflow 里引用的 step id 是否存在、workflow 是否漏传输入。
+超时并无限续跑）、workflow 里引用的 step id 是否存在、workflow 是否漏传输入；以及这轮迁移之后
+新增的几条——`:run_py` 的参数个数（第 9 个会被无声丢掉）与 `-u`、`scripts/` 下有没有混回 `.ps1`、
+`scripts/qtwebengine/` 下每个脚本是否**真的被调用**（不是被注释提到）、每个 Python 脚本能否编译、
+`build.cmd` 有没有单独处理 `check-ccache-bound.py` 的用法错误退出码 3（它必须与「判断不了」的 2
+分开，否则一次参数写错就静默关掉 ccache 门禁）。
