@@ -46,8 +46,11 @@ from pathlib import Path
 
 RECORD_SUFFIX = ".dist-info/RECORD"
 CHUNK = 1 << 20
-# 新增条目用一个固定时间戳：同一套输入重复打包要给出同一个 sha256，否则"这个产物是从哪来的"
-# 就没法靠摘要复核了。
+# 新增条目用一个固定时间戳：同一套输入 + 同一个解释器重复打包要给出同一个 sha256。
+# 跨解释器只能保证**内容**一致：容器里那层 deflate 字节由打包用的 Python 的 zlib 决定，
+# 实测 3.12 与 3.14 压出来的总大小差 3.7 MB，而 RECORD/CRC/大小逐条相同。所以 workflow 拿
+# `python_version` 钉住解释器（换解释器等于换一份字节），Release 里的 SHA256SUMS 钉住的是
+# 实际发出去的那份字节。
 FIXED_DATE_TIME = (2025, 3, 24, 22, 52, 20)
 
 

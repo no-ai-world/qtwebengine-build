@@ -231,6 +231,9 @@ jobs:
             与上游逐字节相同的轮子**原样透传**，没有重新打包——它们的 sha256 与 PyPI 上一致，
             可以独立核对。每个轮子的 RECORD 都按新内容重算过，`pip uninstall` 不会留垃圾。
 
+            想让产出与这里的 `SHA256SUMS` 逐字节对上，用同一个 Python 版本重打
+            （`python_version`，这里是 3.12）：换解释器只影响容器那层 deflate 字节，内容不变。
+
             ## 运行时来源与口径
 
             运行时取自本仓库的 Release `${{ inputs.webengine_tag != '' && inputs.webengine_tag || format('qtwebengine-{0}-win64-msvc2022-codecs', inputs.pyside_version) }}`，
