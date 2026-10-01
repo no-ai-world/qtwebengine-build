@@ -98,7 +98,9 @@ zlib 决定，实测 3.12 与 3.14 压出来的总大小差 3.7 MB，而 **RECOR
 相同**（内容一致，只是压缩结果不同）。所以：
 
 * `python_version` 是"产物摘要的一部分"——想复核摘要就用同一个解释器；
-* Release 里的 `SHA256SUMS` 钉的是**实际发出去的那份字节**，与 GitHub 自己的资产摘要一致；
+* Release 里的 `SHA256SUMS` 钉的是**实际发出去的那份字节**，与 GitHub 自己的资产摘要一致，
+  行尾是 LF（`sha256sum -c SHA256SUMS` 在 Linux/macOS 上也能直接核；Windows 的
+  `Set-Content` 默认写 CRLF，会把整份清单核废，所以那一步写完还会自己查一遍有没有 CR）；
 * 三个透传的轮子不受这件事影响，它们的 sha256 与 PyPI 上完全相同。
 
 ## 本地复现整条链

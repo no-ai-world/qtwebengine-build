@@ -153,7 +153,15 @@ jobs:
             '{0}  {1}' -f (Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash.ToLower(), $_.Name
           }
           if (-not $lines) { throw "$env:WHEELS_DIR 里没有轮子" }
-          Set-Content -LiteralPath (Join-Path 'dist' 'SHA256SUMS') -Value $lines -Encoding ascii
+          # 行尾必须是 LF：Set-Content 在 Windows 上默认写 CRLF，而 `sha256sum -c`（Linux/macOS）
+          # 会把 CR 当成文件名的一部分，整份清单一条都核不了（实测就是这样：
+          # `'PySide6_Addons-…whl'$'\r': No such file or directory`）。写完自己查一遍，
+          # 不指望下一个人记得这件事。
+          $path = Join-Path 'dist' 'SHA256SUMS'
+          Set-Content -LiteralPath $path -Value (($lines -join "`n") + "`n") -NoNewline -Encoding ascii
+          if ([System.IO.File]::ReadAllBytes($path) -contains 13) {
+            throw 'SHA256SUMS 里混进了 CR：sha256sum -c 在 Linux/macOS 上会整份读不了'
+          }
           $lines | Write-Host
 
       - name: 离线安装自测（一次性 venv，装完逐字节核对）
@@ -216,8 +224,9 @@ jobs:
             ```
 
             四个轮子（shiboken6 / PySide6-Essentials / PySide6-Addons / PySide6）要放在同一个目录里，
-            `SHA256SUMS` 是这套轮子的摘要清单。装一个改过的 Addons 去配 PyPI 上的 Essentials
-            也能跑，但版本必须严格对齐——错配是运行期崩溃，不是加载期报错。
+            `SHA256SUMS` 是这套轮子的摘要清单（`sha256sum -c SHA256SUMS` 可直接核）。装一个改过的
+            Addons 去配 PyPI 上的 Essentials 也能跑，但版本必须严格对齐——错配是运行期崩溃，
+            不是加载期报错。
 
             ## 里面改了什么
 
