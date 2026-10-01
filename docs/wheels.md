@@ -61,7 +61,7 @@ gh workflow run build-pyside6-wheels.yml --repo <owner>/qtwebengine-build \
 | --- | --- |
 | 被改动过的轮子 | 实测 = 一个 `PySide6_Addons-6.8.3+codecs-cp39-abi3-win_amd64.whl`；集合由上面那条规则决定 |
 | `SHA256SUMS` | 只有实际发出去的文件；行尾 LF，`sha256sum -c SHA256SUMS` 可直接核 |
-| `MANIFEST.json` | 机器可读的账：发出去的（版本/摘要/改动了哪些文件）+ **从 PyPI 解析的那几份的 URL 与摘要** |
+| `MANIFEST.json` | 机器可读的账：`published`（发出去的：版本/摘要/改动了哪些文件）、`unchanged_from_upstream`（与上游逐字节相同、因此没上架的发行版）、`from_pypi`（装这一套时由 PyPI 解析的，带 URL 与 sha256）、`notes`（这三个键各是什么意思，写在文件里） |
 | `RELEASE_NOTES.md` | Release 正文。**生成**的：文件名、改动项、安装命令都来自实际产物，不是手写文案（手写文案会与产物漂移） |
 
 **不在这里的轮子与 PyPI 上的原件逐字节相同**（实测摘要一致），所以从 PyPI 解析即可，

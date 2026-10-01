@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import json
 import shutil
 import subprocess
 import sys
@@ -181,22 +182,62 @@ def check_publish_rule() -> None:
             out = workdir / "wheels"
             publish = workdir / "publish"
             manifest = workdir / "inject-manifest.json"
+            # 假的上游账本：用 **PyPI 项目名**（连字符），而注入账本里是**文件名里的名字**
+            # （下划线）。两边不归一化的话，已经发布的那份会被当成"还要从 PyPI 取"，
+            # 照着 MANIFEST 做的人正好拿到官方包——这条断言就是钉这个。
+            upstream_manifest = workdir / "upstream-manifest.json"
+            upstream_manifest.write_text(
+                json.dumps(
+                    {
+                        "version": VERSION,
+                        "packages": [
+                            {
+                                "name": name.replace("_", "-"),
+                                "filename": f"{name}-{VERSION}-py3-none-any.whl",
+                                "url": f"https://files.pythonhosted.org/{name}",
+                                "sha256": "0" * 64,
+                            }
+                            for name in ("PySide6", "PySide6_Addons", "PySide6_Essentials", "shiboken6")
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
             rc, inject_log = run_script(
                 INJECT, "-Runtime", str(runtime), "-Wheels", str(wheels_dir),
                 "-Destination", str(out), "-ExpectVersion", VERSION, "-Manifest", str(manifest),
             )
             if rc == 0:
                 rc, stage_log = run_script(
-                    STAGE, "-Stage", str(out), "-Inject", str(manifest), "-Destination", str(publish)
+                    STAGE, "-Stage", str(out), "-Inject", str(manifest),
+                    "-Upstream", str(upstream_manifest), "-Destination", str(publish),
                 )
             else:
                 stage_log = ""
             got = sorted(p.name for p in publish.glob("*.whl")) if publish.is_dir() else []
             sums = (publish / "SHA256SUMS").read_bytes() if (publish / "SHA256SUMS").is_file() else b""
-        hit = rc == 0 and got == expected and b"\r" not in sums and sums.endswith(b"\n")
+            data = (
+                json.loads((publish / "MANIFEST.json").read_text(encoding="utf-8"))
+                if (publish / "MANIFEST.json").is_file()
+                else {}
+            )
+            # MANIFEST 的 from_pypi 只能列"没上架"的那些（归一化后比对）
+            published_dists = {
+                w["name"].replace("_", "-").lower() for w in data.get("published", [])
+            }
+            leaked = sorted(
+                p["name"]
+                for p in data.get("from_pypi", [])
+                if p["name"].replace("_", "-").lower() in published_dists
+            )
+        hit = rc == 0 and got == expected and b"\r" not in sums and sums.endswith(b"\n") and not leaked
         print(f"  [{'PASS' if hit else 'FAIL'}] {title}")
         if not hit:
-            print(f"        期望发布 {expected}\n        实际 rc={rc} 发布 {got}\n        {inject_log.strip()[-200:]} {stage_log.strip()[-200:]}")
+            print(
+                f"        期望发布 {expected}\n        实际 rc={rc} 发布 {got}\n"
+                f"        from_pypi 里混进了已上架的：{leaked}\n"
+                f"        {inject_log.strip()[-200:]} {stage_log.strip()[-200:]}"
+            )
             failures.append(title)
 
 

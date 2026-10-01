@@ -77,6 +77,16 @@ def requirement_name(distribution: str) -> str:
     return distribution.replace("_", "-")
 
 
+def normalized(distribution: str) -> str:
+    """比对用的规范名：PEP 503 意义上的等价（`PySide6_Addons` == `pyside6-addons`）。
+
+    两个账本里的名字来自不同的地方——注入账本取的是**文件名**里的发行版名（下划线），
+    fetch 账本取的是 **PyPI 项目名**（连字符）。不归一化就会出现"同一个发行版被当成两个"，
+    于是已经发布的那份又被列进"从 PyPI 取"（照着做的人正好拿到官方包）。
+    """
+    return distribution.replace("_", "-").lower()
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description="stage the wheels that must be published")
     ap.add_argument("-Stage", required=True, help="注入后的轮子目录（含透传的那些）")
@@ -137,9 +147,16 @@ def main() -> int:
         return 1
 
     # 3. MANIFEST.json：发出去的 + 从 PyPI 解析的，各自的来源与摘要
+    #
+    #    这里要**排除**已经发布的那几个发行版：PySide6-Addons 也在 fetch 的输入清单里（它是
+    #    注入的底子），但它是**官方**那一份——把它列进"从 PyPI 取"，照着做的人拿到的就是没有
+    #    编解码器的包，恰好是这套产物要避免的失败模式。
+    published_names = {normalized(w["name"]) for w in published}
     pinned = []
     if upstream:
         for pkg in upstream.get("packages", []):
+            if normalized(pkg["name"]) in published_names:
+                continue
             pinned.append(
                 {
                     "name": pkg["name"],
@@ -150,6 +167,11 @@ def main() -> int:
                 }
             )
     manifest = {
+        "notes": {
+            "published": "本 Release 提供的轮子：内容被运行时改动过，必须用这里的这一份",
+            "unchanged_from_upstream": "与 PyPI 上逐字节相同、因此没有上架的发行版（不必从 PyPI 取来核对，装的时候会自动解析到同一份）",
+            "from_pypi": "装这一套时由 PyPI 解析的发行版；要攒离线 wheelhouse 就按这里的 url/sha256 取",
+        },
         "version": inject.get("version") or (upstream or {}).get("version"),
         "local_version": inject.get("local_version") or "",
         "webengine_tag": args.WebEngineTag,
