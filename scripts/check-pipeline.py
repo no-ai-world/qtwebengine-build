@@ -747,6 +747,21 @@ def check_wheel_pipeline(root: Path) -> None:
         if needle not in text:
             fail("wheels/release", f"发布步少了 {needle}：{why}")
 
+    # 6. 启动脚本的调用行必须带 -u -X utf8。这一条是真踩过的：run 36806802921 里
+    #    `python scripts/pyside6/fetch-pyside6-wheels.py` 跑到最后一句中文日志时抛
+    #    UnicodeEncodeError（CI 把输出接进管道，locale 是 cp1252），整步退出码 1——前面
+    #    四个轮子都已经下好了。没有 -u 则块缓冲，日志要等进程结束才出来。
+    for lineno, line in enumerate(text.splitlines(), 1):
+        stripped = line.strip()
+        if stripped.startswith("#") or not re.search(r"\bpython\s+.*\.py\b", line):
+            continue
+        if "-X utf8" not in line or not re.search(r"\bpython\s+-u\b", line):
+            fail(
+                "wheels/scripts",
+                f"{WHEEL_WORKFLOW}:{lineno}: 启动脚本没有 -u -X utf8（中文日志会抛 "
+                f"UnicodeEncodeError、输出还会块缓冲）：{stripped[:80]}",
+            )
+
 
 # ---------------------------------------------------------------------------
 # 剩下的 PowerShell：workflow 里那十几段内联脚本。迁移之后 .ps1 文件已经没有了，

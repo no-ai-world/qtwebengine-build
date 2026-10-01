@@ -133,14 +133,14 @@ jobs:
       - name: 取官方 PySide6 轮子（PyPI，带摘要核对）
         shell: pwsh
         run: |
-          python scripts/pyside6/fetch-pyside6-wheels.py -Version $env:PYSIDE_VERSION -Destination $env:UPSTREAM_DIR
+          python -u -X utf8 scripts/pyside6/fetch-pyside6-wheels.py -Version $env:PYSIDE_VERSION -Destination $env:UPSTREAM_DIR
           if ($LASTEXITCODE -ne 0) { throw '取官方轮子失败' }
 
       - name: 注入运行时（重算 RECORD 并逐个自证）
         shell: pwsh
         run: |
           $zip = Join-Path $env:RUNTIME_DIR "qtwebengine-$env:PYSIDE_VERSION-win64-msvc2022-codecs.zip"
-          python scripts/pyside6/inject-webengine-runtime.py `
+          python -u -X utf8 scripts/pyside6/inject-webengine-runtime.py `
             -Runtime $zip -Wheels $env:UPSTREAM_DIR -Destination $env:WHEELS_DIR `
             -ExpectVersion $env:PYSIDE_VERSION
           if ($LASTEXITCODE -ne 0) { throw '注入失败' }
@@ -161,7 +161,7 @@ jobs:
         shell: pwsh
         run: |
           $zip = Join-Path $env:RUNTIME_DIR "qtwebengine-$env:PYSIDE_VERSION-win64-msvc2022-codecs.zip"
-          python scripts/pyside6/verify-wheels.py `
+          python -u -X utf8 scripts/pyside6/verify-wheels.py `
             -Runtime $zip -Wheels $env:WHEELS_DIR -Version $env:PYSIDE_VERSION
           if ($LASTEXITCODE -ne 0) { throw '离线安装自测失败：这套轮子不能算"完整可用"' }
 

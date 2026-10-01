@@ -52,6 +52,18 @@ def log(msg: str) -> None:
     print(msg, flush=True)
 
 
+def use_utf8_streams() -> None:
+    """CI 把输出接进管道，此时 Python 用 locale 编码（cp1252）会对中文抛 UnicodeEncodeError，
+    而且默认块缓冲会让日志攒在缓冲区里。两个都从脚本内部兜住，不依赖调用方记得加
+    `-u -X utf8`（workflow 里加了）。
+    """
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace", line_buffering=True)
+        except (AttributeError, ValueError, OSError):
+            pass
+
+
 def http_get(url: str, timeout: float) -> bytes:
     req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
     with urllib.request.urlopen(req, timeout=timeout) as resp:  # noqa: S310 - 固定 https
@@ -121,6 +133,7 @@ def main() -> int:
     ap.add_argument("-Index", default=DEFAULT_INDEX, help="PyPI JSON API 前缀")
     ap.add_argument("-Timeout", type=float, default=120.0, help="单次 HTTP 超时（秒）")
     args = ap.parse_args()
+    use_utf8_streams()
 
     version = args.Version.strip()
     packages = [p.strip() for p in args.Packages.split(",") if p.strip()]

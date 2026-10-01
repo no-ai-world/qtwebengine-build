@@ -37,6 +37,18 @@ def log(msg: str) -> None:
     print(msg, flush=True)
 
 
+def use_utf8_streams() -> None:
+    """CI 把输出接进管道，此时 Python 用 locale 编码（cp1252）会对中文抛 UnicodeEncodeError，
+    而且默认块缓冲会让日志攒在缓冲区里（pip 的输出要一行行看）。两个都从脚本内部兜住，
+    不依赖调用方记得加 `-u -X utf8`（workflow 里加了）。
+    """
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace", line_buffering=True)
+        except (AttributeError, ValueError, OSError):
+            pass
+
+
 def wheel_distribution(path: Path) -> str:
     """`PySide6_Addons-6.8.3-cp39-abi3-win_amd64.whl` → `PySide6_Addons`。
 
@@ -164,6 +176,7 @@ def main() -> int:
     )
     ap.add_argument("-Timeout", type=float, default=1800.0, help="pip 安装的超时（秒）")
     args = ap.parse_args()
+    use_utf8_streams()
 
     python_exe = args.PythonExecutable or sys.executable
 

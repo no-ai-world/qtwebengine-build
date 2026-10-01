@@ -251,8 +251,8 @@ def main() -> int:
         "没有被 workflow 的非注释行实际调用",
         lambda r: edit_wheel_workflow(
             r,
-            "          python scripts/pyside6/inject-webengine-runtime.py `\n",
-            "          # python scripts/pyside6/inject-webengine-runtime.py 以前在这里\n",
+            "          python -u -X utf8 scripts/pyside6/inject-webengine-runtime.py `\n",
+            "          # python -u -X utf8 scripts/pyside6/inject-webengine-runtime.py 以前在这里\n",
         ),
     )
     expect(
@@ -260,8 +260,8 @@ def main() -> int:
         "verify-wheels.py 没有被 workflow 的非注释行实际调用",
         lambda r: edit_wheel_workflow(
             r,
-            "          python scripts/pyside6/verify-wheels.py `\n",
-            "          # python scripts/pyside6/verify-wheels.py 以前在这里\n",
+            "          python -u -X utf8 scripts/pyside6/verify-wheels.py `\n",
+            "          # python -u -X utf8 scripts/pyside6/verify-wheels.py 以前在这里\n",
         ),
     )
     expect(
@@ -271,6 +271,17 @@ def main() -> int:
             r,
             "if: ${{ success() && steps.wheelcheck.outcome == 'success' && inputs.create_release }}",
             "if: ${{ success() && inputs.create_release }}",
+        ),
+    )
+    # 真踩过：run 36806802921 里取轮子那一步打印"完成：4 个轮子"时抛 UnicodeEncodeError
+    # （管道下 locale 是 cp1252），整步退出码 1——四个轮子都已经下好了。
+    expect(
+        "启动脚本时没带 -X utf8 / -u（中文日志会抛 UnicodeEncodeError）",
+        "启动脚本没有 -u -X utf8",
+        lambda r: edit_wheel_workflow(
+            r,
+            "python -u -X utf8 scripts/pyside6/inject-webengine-runtime.py",
+            "python scripts/pyside6/inject-webengine-runtime.py",
         ),
     )
     expect(

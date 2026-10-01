@@ -55,6 +55,18 @@ def log(msg: str) -> None:
     print(msg, flush=True)
 
 
+def use_utf8_streams() -> None:
+    """CI 把输出接进管道，此时 Python 用 locale 编码（cp1252）会对中文抛 UnicodeEncodeError，
+    而且默认块缓冲会让日志攒在缓冲区里。两个都从脚本内部兜住，不依赖调用方记得加
+    `-u -X utf8`（workflow 里加了）。
+    """
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace", line_buffering=True)
+        except (AttributeError, ValueError, OSError):
+            pass
+
+
 def sha256_file(path: Path) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as fh:
@@ -312,6 +324,7 @@ def main() -> int:
         "-ExpectVersion", default="", help="轮子文件名里必须出现的版本（例如 6.8.3）；留空不检查"
     )
     args = ap.parse_args()
+    use_utf8_streams()
 
     runtime_path = Path(args.Runtime)
     if not runtime_path.exists():

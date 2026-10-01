@@ -102,11 +102,14 @@ python scripts/check-pipeline.py
 （判据是调用而不是「注释里提到」——build.cmd 与 workflow 的注释、报错文案里都写着脚本名）、
 每个 Python 脚本能否编译、build.cmd 有没有单独处理退出码 3、build.cmd 有没有占用 `RC` 这个名字，
 以及 `auto_continue` 的预检步是否真的 `throw`（秘密缺失必须在几秒内失败，而不是轮末才发现）。
-轮子流水线另有四条：运行时必须**从已有 Release 取**（`gh release download` 用 `WEBENGINE_TAG`，
+轮子流水线另有五条：运行时必须**从已有 Release 取**（`gh release download` 用 `WEBENGINE_TAG`，
 不许出现 `build.cmd`）、"完整一套"的四个发行版要落在脚本的清单里、离线安装自测必须在发布步
 之前**真的跑过**（判据是发布步引用 `steps.wheelcheck.outcome`，而不是全文里有没有 `--no-index`
 ——发布说明的正文里就写着那条 pip 命令）、发布步要保留 `overwrite_files` 与
-`fail_on_unmatched_files`。其余检查项见 [运行与参数](run.md#派之前先自检)。
+`fail_on_unmatched_files`，以及**每一处启动脚本的调用行都要带 `-u -X utf8`**（真踩过：run
+36806802921 里取轮子那一步打印"完成：4 个轮子"时抛 `UnicodeEncodeError`，因为 CI 把输出接进
+管道、locale 是 cp1252，而四个轮子其实都已经下好了）。其余检查项见
+[运行与参数](run.md#派之前先自检)。
 
 ### 三个回归测试
 
