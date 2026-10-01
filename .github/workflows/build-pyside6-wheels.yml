@@ -228,6 +228,30 @@ jobs:
           if-no-files-found: warn
           retention-days: 30
 
+      - name: 清掉不属于本次发布集合的旧资产
+        # softprops/action-gh-release 只增不删：发布集合变小（比如这次从四个变成一个）时，
+        # 上一轮的轮子会原地留着，Release 就与 MANIFEST/说明自相矛盾了——更糟的是旧的
+        # `PySide6_Addons-6.8.3`（没有 +codecs）还在的话，解析器可能挑到它。
+        if: ${{ success() && inputs.create_release }}
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference = 'Continue'
+          $keep = @{}
+          Get-ChildItem -LiteralPath $env:PUBLISH_DIR -File | ForEach-Object { $keep[$_.Name] = $true }
+          $json = gh release view $env:RELEASE_TAG --repo $env:GITHUB_REPOSITORY --json assets 2>$null
+          if ($LASTEXITCODE -ne 0) { Write-Host "Release $env:RELEASE_TAG 还不存在，无需清理"; exit 0 }
+          $removed = 0
+          foreach ($a in ($json | ConvertFrom-Json).assets) {
+            if ($keep.ContainsKey($a.name)) { continue }
+            Write-Host "删掉不再属于发布集合的资产：$($a.name)"
+            gh release delete-asset $env:RELEASE_TAG $a.name --repo $env:GITHUB_REPOSITORY --yes
+            if ($LASTEXITCODE -ne 0) { throw "删不掉旧资产 $($a.name)：Release 会与发布集合不一致" }
+            $removed++
+          }
+          Write-Host "清理完成：删掉 $removed 个，保留 $($keep.Count) 个"
+
       - name: 发布 Release
         # 显式引用自测步的结论：这一步的意义就是"装不上就不发"，不能只靠 success() 的隐含顺序
         if: ${{ success() && steps.wheelcheck.outcome == 'success' && inputs.create_release }}

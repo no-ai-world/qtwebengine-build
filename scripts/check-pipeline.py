@@ -764,6 +764,20 @@ def check_wheel_pipeline(root: Path) -> None:
     # Release 正文也是生成的（手写文案会漂，漂了就与发出去的产物对不上）
     if "body_path:" not in text:
         fail("wheels/publish", "Release 正文不是生成出来的（缺 body_path）：手写文案会与产物漂移")
+    # 发布集合变小时（四个 → 一个），上一轮的资产不会自己消失：action-gh-release 只增不删。
+    # 实测踩过：集合已经只剩一个轮子，Release 里却留着上一轮的三份，连旧的
+    # `PySide6_Addons-6.8.3`（没有 +codecs）都在——解析器可能挑到它，而说明说它不在这里。
+    cleanup = [
+        line
+        for line in text.splitlines()
+        if "gh release delete-asset" in line and not line.lstrip().startswith("#")
+    ]
+    if not cleanup:
+        fail(
+            "wheels/publish",
+            "发布前没有清掉不属于本次发布集合的旧资产（非注释行上的 gh release delete-asset）："
+            "action-gh-release 只增不删，集合变小时 Release 会与 MANIFEST/说明自相矛盾",
+        )
 
     # 5. 发布必须以"离线装过一次"为前置：装不上的一套轮子不该发出去。
     #    判据是发布步**显式引用**自测步的 id，而不是全文里有没有 `--no-index`——发布说明的

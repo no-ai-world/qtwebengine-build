@@ -299,6 +299,17 @@ def main() -> int:
         "Release 正文不是生成出来的",
         lambda r: edit_wheel_workflow(r, "          body_path: dist/publish/RELEASE_NOTES.md\n", ""),
     )
+    # 实测踩过：发布集合从四个缩成一个之后，Release 里仍留着上一轮的三份资产，
+    # 连旧的 PySide6_Addons-6.8.3（没有 +codecs）都在。
+    expect(
+        "发布前不清旧资产（action-gh-release 只增不删，集合变小时会自相矛盾）",
+        "没有清掉不属于本次发布集合的旧资产",
+        lambda r: edit_wheel_workflow(
+            r,
+            "            gh release delete-asset $env:RELEASE_TAG $a.name --repo $env:GITHUB_REPOSITORY --yes\n",
+            "            # 删旧资产那一步去掉了（注释里还写着 delete-asset 这个词会被检查抓到吗）\n",
+        ),
+    )
     expect(
         "fetch 退回写死清单（不再从 requires_dist 推一套的构成）",
         "不是从 PySide6 的 requires_dist 推的",
