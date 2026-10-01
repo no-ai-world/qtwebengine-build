@@ -290,12 +290,43 @@ def main() -> int:
         lambda r: edit_wheel_workflow(r, "overwrite_files: true", "overwrite_files: false"),
     )
     expect(
-        "fetch 的清单里少了一个发行版",
-        "的清单少了",
+        "发布集合不再由账本决定（退回发 dist/wheels 全部）",
+        "发布步不是发暂存集合",
+        lambda r: edit_wheel_workflow(r, "files: dist/publish/*", "files: dist/wheels/*.whl"),
+    )
+    expect(
+        "Release 正文退回手写（会与产物漂移）",
+        "Release 正文不是生成出来的",
+        lambda r: edit_wheel_workflow(r, "          body_path: dist/publish/RELEASE_NOTES.md\n", ""),
+    )
+    expect(
+        "fetch 退回写死清单（不再从 requires_dist 推一套的构成）",
+        "不是从 PySide6 的 requires_dist 推的",
         lambda r: (r / "scripts/pyside6/fetch-pyside6-wheels.py").write_text(
             (r / "scripts/pyside6/fetch-pyside6-wheels.py")
             .read_text(encoding="utf-8")
-            .replace('    "PySide6-Addons",\n', ""),
+            .replace("requires_dist", "REPLACED"),
+            encoding="utf-8",
+        ),
+    )
+    expect(
+        "注入脚本不再写账本（发布集合就没有依据了）",
+        "注入脚本不写账本",
+        lambda r: (r / "scripts/pyside6/inject-webengine-runtime.py").write_text(
+            (r / "scripts/pyside6/inject-webengine-runtime.py")
+            .read_text(encoding="utf-8")
+            .replace('"-Manifest"', '"-NoManifestAnymore"'),
+            encoding="utf-8",
+        ),
+    )
+    expect(
+        "自测不再离线装（解析器会去 PyPI 补齐，完整性判据静默失效）",
+        'verify-wheels.py 的安装命令里少了 "--no-index"',
+        lambda r: (r / "scripts/pyside6/verify-wheels.py").write_text(
+            (r / "scripts/pyside6/verify-wheels.py")
+            .read_text(encoding="utf-8")
+            .replace('"--no-index",', '')
+            .replace('"--find-links",', ""),
             encoding="utf-8",
         ),
     )

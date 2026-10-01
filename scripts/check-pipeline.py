@@ -653,18 +653,24 @@ def check_ccache_wiring(root: Path) -> None:
 # 轮子流水线（build-pyside6-wheels.yml）：不编译，只把**已经发布**的运行时打进官方轮子
 # ---------------------------------------------------------------------------
 
-WHEEL_SCRIPTS = ("fetch-pyside6-wheels.py", "inject-webengine-runtime.py", "verify-wheels.py")
-# 「完整一套」的四个发行版。PyPI 的项目名带连字符、轮子文件名里是下划线，两边各写各的，
-# 不要"统一"它们——统一了就成了两个都不对。
-WHEEL_PROJECTS = ("shiboken6", "PySide6-Essentials", "PySide6-Addons", "PySide6")
-WHEEL_FILENAMES = ("shiboken6", "PySide6_Essentials", "PySide6_Addons", "PySide6")
+WHEEL_SCRIPTS = (
+    "fetch-pyside6-wheels.py",
+    "inject-webengine-runtime.py",
+    "stage-publish-set.py",
+    "verify-wheels.py",
+)
+# 发布步要发的是**暂存下来的那一小撮**，不是注入目录里的全部轮子：后者含"与上游逐字节相同"
+# 的那几份，发出去就是搬运上游原件（大小、口径、来源都对不上）。
+PUBLISH_GLOB = "files: dist/publish/*"
 
 
 def check_wheel_pipeline(root: Path) -> None:
     """轮子流水线的几条不变量。
 
     这条流水线存在的全部意义是「用**已经发布**的运行时换掉官方轮子里的文件」，所以最该守住
-    两件事：别再编一遍（那又是一轮几小时），以及发出去的确实是一套装得上、装完对的轮子。
+    三件事：别再编一遍（那又是一轮几小时）；发出去的确实是一套装得上、装完对的轮子；以及
+    **发哪几个文件由"运行时实际改动了谁"决定**——写死清单/写死 glob 的那一刻，规则就与实现
+    脱钩了（哪天 icudtl.dat 变了，Essentials 必须跟着发，而写死的 glob 不会知道）。
     """
     path = root / WHEEL_WORKFLOW
     if not path.is_file():
@@ -700,7 +706,7 @@ def check_wheel_pipeline(root: Path) -> None:
     if "build.cmd" in text:
         fail("wheels/source", "轮子流水线里出现了 build.cmd：这条流水线不该编译任何东西")
 
-    # 2. 三个脚本都要真的被调起（判据同 build.cmd 那边：调用，而不是"注释里提到"）
+    # 2. 脚本都要真的被调起（判据同 build.cmd 那边：调用，而不是"注释里提到"）
     called = workflow_invocations(text)
     for name in WHEEL_SCRIPTS:
         if not (root / PYSIDE6_DIR / name).is_file():
@@ -711,28 +717,72 @@ def check_wheel_pipeline(root: Path) -> None:
                 f"{PYSIDE6_DIR}/{name} 没有被 workflow 的非注释行实际调用（死代码？）",
             )
 
-    # 3. "完整一套"要落在脚本里，而不是等用户在 pip 那里撞见
+    # 3. 闭包是推出来的，不是写死的：取哪几个发行版由 PySide6 自己的 requires_dist 决定。
+    #    写死清单的代价是上游调整拆分方式（WebEngine 曾经在 Essentials 里）之后，清单变成
+    #    一个假的判据，而失败要等到注入阶段才以"某个文件谁都认领不到"的形式出现。
     fetch = read_text(root / PYSIDE6_DIR / "fetch-pyside6-wheels.py")
-    missing = [name for name in WHEEL_PROJECTS if f'"{name}"' not in fetch]
-    if missing:
-        fail(
-            "wheels/complete",
-            f"fetch-pyside6-wheels.py 的清单少了 {missing}：一套轮子缺一个，"
-            "`--no-index` 安装就会在用户机器上失败",
-        )
-    gate = read_text(root / PYSIDE6_DIR / "verify-wheels.py")
-    unseen = [name for name in WHEEL_FILENAMES if f'"{name}"' not in gate]
-    if unseen:
-        fail(
-            "wheels/complete",
-            f"verify-wheels.py 认不出 {unseen}：少了任何一个，这道门禁就看不出这一套不完整",
-        )
+    for needle, why in (
+        ("requires_dist", "一套轮子的构成不是从 PySide6 的 requires_dist 推的（写死清单？）"),
+        ("-Manifest", "fetch 不写账本：后面的发布集合与 Release 说明就没有据可依"),
+    ):
+        if needle not in fetch:
+            fail("wheels/complete", f"fetch-pyside6-wheels.py：{why}")
 
-    # 4. 发布必须以"离线装过一次"为前置：装不上的一套轮子不该发出去。
+    # 3b. 注入这一侧要能算"谁被改了"（这是发布集合的唯一依据），并留出两个逃生口
+    inject = read_text(root / PYSIDE6_DIR / "inject-webengine-runtime.py")
+    for needle, why in (
+        ("-Manifest", "注入脚本不写账本：'谁被改了'就没法传给发布步骤"),
+        ("-LocalVersion", "注入脚本不能挂本地版本段：索引里同时有官方包时解析器可能选错那份"),
+        ("-NewFileOwner", "注入脚本没有新文件归属的逃生口：上游加一个新文件就只能改代码"),
+    ):
+        if needle not in inject:
+            fail("wheels/complete", f"inject-webengine-runtime.py：{why}")
+
+    # 4. 发布集合必须来自账本（暂存脚本），而不是 workflow 里的 glob
+    if PUBLISH_GLOB not in text:
+        fail(
+            "wheels/publish",
+            f"发布步不是发暂存集合（缺 `{PUBLISH_GLOB}`）：把 dist/wheels 整个发出去等于"
+            "连'与上游逐字节相同'的那几份一起搬运",
+        )
+    stage_line = next(
+        (
+            i
+            for i, line in enumerate(text.splitlines())
+            if "stage-publish-set.py" in line and not line.lstrip().startswith("#")
+        ),
+        None,
+    )
+    publish_line = next(
+        (i for i, line in enumerate(text.splitlines()) if PUBLISH_GLOB in line), None
+    )
+    if stage_line is None or publish_line is None or stage_line > publish_line:
+        fail(
+            "wheels/publish",
+            "挑发布集合的那一步不在发布之前：发布时还没有「该发哪几个」的结论",
+        )
+    # Release 正文也是生成的（手写文案会漂，漂了就与发出去的产物对不上）
+    if "body_path:" not in text:
+        fail("wheels/publish", "Release 正文不是生成出来的（缺 body_path）：手写文案会与产物漂移")
+
+    # 5. 发布必须以"离线装过一次"为前置：装不上的一套轮子不该发出去。
     #    判据是发布步**显式引用**自测步的 id，而不是全文里有没有 `--no-index`——发布说明的
     #    正文里就写着那条 pip 命令，按子串搜的话把自测步整段删掉、说明留着，检查照样通过。
     if not re.search(r"^\s*id: wheelcheck\s*$", text, re.MULTILINE):
         fail("wheels/gate", "workflow 里的离线安装自测没有 id: wheelcheck：发布步没法引用它的结论")
+    #    而"这一套完不完整"正是由 `--no-index` 那次安装判断的（少了任何一个发行版都会失败）。
+    #    丢掉 --no-index，解析器会去 PyPI 把缺的补上，这道判据就静默消失了——所以它也守着。
+    #    判据是**参数形式**（带引号），不是全文子串：脚本的说明里就写着 `--no-index --find-links`
+    #    这两个词，按子串搜的话把参数从命令列表里删掉、说明留着，检查照样通过——本条守卫的第一版
+    #    就是这么写的，被负向测试当场抓出来。
+    gate_script = read_text(root / PYSIDE6_DIR / "verify-wheels.py")
+    for needle in ('"--no-index"', '"--find-links"'):
+        if needle not in gate_script:
+            fail(
+                "wheels/gate",
+                f"verify-wheels.py 的安装命令里少了 {needle}：解析器会去 PyPI 补齐，"
+                "这一套完不完整就不再被判断了",
+            )
     if "steps.wheelcheck.outcome == 'success'" not in text:
         fail(
             "wheels/gate",

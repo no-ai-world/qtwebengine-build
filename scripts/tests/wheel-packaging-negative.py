@@ -35,6 +35,7 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parents[2]
 INJECT = REPO / "scripts/pyside6/inject-webengine-runtime.py"
 VERIFY = REPO / "scripts/pyside6/verify-wheels.py"
+STAGE = REPO / "scripts/pyside6/stage-publish-set.py"
 
 VERSION = "6.8.3"
 failures: list[str] = []
@@ -143,6 +144,62 @@ def expect(name: str, script: Path, build, expected: str, expect_rc: int = 1) ->
         failures.append(name)
 
 
+def check_publish_rule() -> None:
+    """发布集合的规则：**只有内容被改动过的轮子进集合，而"谁被改了"由数据决定。**
+
+    这是整条流水线唯一一条真正的策略，所以它必须有测试，而不是靠"这次跑出来是一个"。
+    用最小的假轮子跑两种数据：改的只有 Addons / icudtl.dat 也变了 → 集合里要多一个 Essentials。
+    """
+    global checked
+    scenarios = [
+        (
+            "只有 Addons 改（icudtl.dat 与上游逐字节相同）",
+            {"Qt6WebEngineCore.dll": b"self-built-core\n", "resources/icudtl.dat": b"official-icu\n"},
+            [f"PySide6_Addons-{VERSION}-py3-none-any.whl"],
+        ),
+        (
+            "icudtl.dat 也变了 → Essentials 必须一起发（这就是「不写死」的意义）",
+            {"Qt6WebEngineCore.dll": b"self-built-core\n", "resources/icudtl.dat": b"self-built-icu\n"},
+            sorted(
+                [
+                    f"PySide6_Addons-{VERSION}-py3-none-any.whl",
+                    f"PySide6_Essentials-{VERSION}-py3-none-any.whl",
+                ]
+            ),
+        ),
+    ]
+    for title, runtime_files, expected in scenarios:
+        checked += 1
+        with tempfile.TemporaryDirectory(prefix="wheelneg-") as tmp:
+            workdir = Path(tmp)
+            runtime = workdir / "runtime.zip"
+            make_runtime(runtime, runtime_files)
+            wheels_dir = workdir / "upstream"
+            wheels_dir.mkdir(parents=True, exist_ok=True)
+            for name, files in default_wheels().items():
+                make_wheel(wheels_dir / name, name.split("-")[0], files)
+            out = workdir / "wheels"
+            publish = workdir / "publish"
+            manifest = workdir / "inject-manifest.json"
+            rc, inject_log = run_script(
+                INJECT, "-Runtime", str(runtime), "-Wheels", str(wheels_dir),
+                "-Destination", str(out), "-ExpectVersion", VERSION, "-Manifest", str(manifest),
+            )
+            if rc == 0:
+                rc, stage_log = run_script(
+                    STAGE, "-Stage", str(out), "-Inject", str(manifest), "-Destination", str(publish)
+                )
+            else:
+                stage_log = ""
+            got = sorted(p.name for p in publish.glob("*.whl")) if publish.is_dir() else []
+            sums = (publish / "SHA256SUMS").read_bytes() if (publish / "SHA256SUMS").is_file() else b""
+        hit = rc == 0 and got == expected and b"\r" not in sums and sums.endswith(b"\n")
+        print(f"  [{'PASS' if hit else 'FAIL'}] {title}")
+        if not hit:
+            print(f"        期望发布 {expected}\n        实际 rc={rc} 发布 {got}\n        {inject_log.strip()[-200:]} {stage_log.strip()[-200:]}")
+            failures.append(title)
+
+
 def main() -> int:
     # 前提：干净输入必须能过，否则下面的"报红"可能只是别的原因
     global checked
@@ -167,6 +224,8 @@ def main() -> int:
         print("        " + out.strip().replace("\n", "\n        ")[:400])
         return 1
     print("  [PASS] 干净输入通过（负向测试的前提）")
+
+    check_publish_rule()
 
     def identical_runtime(w: Path, r: Path, wd: Path, o: Path) -> None:
         """只有一个轮子、且它与运行时逐字节相同：注入不会改变任何东西。"""
@@ -202,10 +261,12 @@ def main() -> int:
         "没有任何轮子发生实质变化",
     )
     expect(
-        "一套轮子少了一个发行版（不该等到用户机器上才发现）",
+        "轮子版本对不上（不许拿别的版本凑）",
         VERIFY,
-        lambda w, r, wd, o: (wd / f"shiboken6-{VERSION}-py3-none-any.whl").unlink(),
-        "这一套轮子缺了",
+        lambda w, r, wd, o: (wd / f"shiboken6-{VERSION}-py3-none-any.whl").rename(
+            wd / "shiboken6-6.7.0-py3-none-any.whl"
+        ),
+        "版本不是",
     )
 
     print()
