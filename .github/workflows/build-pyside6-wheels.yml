@@ -3,30 +3,38 @@
 #
 # 这条流水线**不编译任何东西**，也不碰 build-qtwebengine：
 #   * 运行时从**已经发布**的 Release 里取（标签 qtwebengine-<版本>-win64-msvc2022-codecs），
-#     所以重发一套轮子只要几分钟，而不是几小时；想换运行时请先去编那一轮；
-#   * 官方轮子从 PyPI 取（scripts/pyside6/fetch-pyside6-wheels.py，带摘要核对），
-#     注入见 scripts/pyside6/inject-webengine-runtime.py。
+#     所以重发一套轮子只要几分钟，而不是几小时；
+#   * 官方轮子从 PyPI 取，取哪几个发行版是**推出来的**（PySide6==<版本> 的 requires_dist），
+#     不是写死的四个；
+#   * 注入见 scripts/pyside6/inject-webengine-runtime.py。
 #
-# 为什么是"一套四个轮子"而不是"一个改过的轮子"
-#   运行时的 64 个文件不落在同一个轮子里：`resources/icudtl.dat` 在 **PySide6_Essentials**
-#   里，其余 63 个在 **PySide6_Addons** 里。只发一个改过的 Addons，用户还得自己去 PyPI
-#   补齐另外三个（而且版本必须严丝合缝），"可 pip 安装"就不成立。所以这里把
-#   shiboken6 / PySide6-Essentials / PySide6-Addons / PySide6 一起发出去。
+# 发哪几个文件：一条规则，不是一次判断
+#   某个轮子必须发 ⟺ 我们的运行时**实际改动**了它的内容（逐字节比对）。
+#   其余轮子与 PyPI 上的原件逐字节相同，re-host 只是搬运，所以不上架——它们在
+#   MANIFEST.json 里被钉住（版本 + sha256），用户从 PyPI 取同一份即可。
+#   实测 PySide6 6.8.3：运行时 64 个文件里只有 6 个真的变了，且都在 PySide6_Addons，
+#   所以发布集合是 {Addons}。哪天 `resources/icudtl.dat`（在 PySide6_Essentials 里）变了，
+#   集合就自动变成 {Addons, Essentials}——**不需要改这里的任何一行**。
+#   scripts/pyside6/stage-publish-set.py 从注入脚本的账本里读这个集合，Release 说明
+#   （含安装命令、改动了哪些文件）也从同一份数据生成，不是手写文案。
 #
-# 没有实质变化的轮子原样透传（实测 Essentials 与上游逐字节相同）：
-#   重打一个没改动过的轮子只会让它的 sha256 与 PyPI 对不上，等于毁掉用户唯一的独立核对手段。
-#   注入脚本自己判断"这个轮子有没有一个字节变了"，没变就直接拷过去。
+# 本地版本段（local_version，默认 codecs）
+#   被改动过的轮子挂上 `+codecs`（6.8.3 → 6.8.3+codecs）。这样它在**任何**解析器眼里都比
+#   PyPI 上的同名同版本轮子大：索引与本地目录同时存在时也会确定地选我们的。实测过那个坑——
+#   `pip install "pyside6==6.8.3" --find-links <目录>` 在没有本地段时会静默装成官方包
+#   （连 --no-cache-dir 都一样，3/3 次），挂上本地段之后就选我们的了。
+#   PEP 440：说明符不带本地段时匹配会忽略候选的本地段，所以 `pyside6==6.8.3` 声明的
+#   `pyside6-addons==6.8.3` 依然被满足（pip check 通过）。
 #
-# 发布的门禁（这一步是打包正确性，不是编解码器有效性）
-#   1. 运行时的 zip 与本仓库 Release 里随包的 .sha256 一致（下载没被中间人换掉）；
-#   2. 注入后每个轮子的 RECORD 与实际内容逐条对得上（脚本自己重新打开产物核对）；
-#   3. 四个轮子在一个**一次性 venv** 里离线装得上（--no-index --find-links），并且
-#      运行时里的 64 个文件在 site-packages 里逐字节落位。
-#   这三条都过了才发 Release；H.264/AAC 到底能不能放，本流水线照旧**不验**（那是浏览器
-#   里的事，见 README 的口径）。
+# 发布的门禁（打包正确性，不是编解码器有效性）
+#   1. 运行时 zip 与本仓库 Release 里随包的 .sha256 一致；
+#   2. 注入后每个轮子的 RECORD 与实际内容逐条对得上（脚本自己重新打开产物核对），
+#      挂了本地版本段的还要核"文件名 / dist-info / METADATA 三者版本一致"；
+#   3. 四个轮子在一次性 venv 里离线装得上（--no-index --find-links），运行时里的
+#      每个文件在 site-packages 里逐字节落位。**注意自测用的是完整的一套**（含从 PyPI
+#      取来的那些），发布的只是其中变化过的那几个——门禁不因为少发而降级。
 #
-# 运行环境要求：windows-2022 级别的 runner、约 3 GB 磁盘（轮子 200 MB + 安装自测 1.2 GB），
-# Python 必须 <3.14（PySide6 6.8.3 的 requires-python 是 >=3.9,<3.14）。
+# 运行环境要求：windows-2022 级别的 runner、约 3 GB 磁盘；Python 必须 <3.14。
 # ============================================================================
 
 name: build-pyside6-wheels
@@ -40,6 +48,14 @@ on:
         default: '6.8.3'
       webengine_tag:
         description: '已有的 QtWebEngine Release 标签（留空 = qtwebengine-<版本>-win64-msvc2022-codecs）'
+        type: string
+        default: ''
+      local_version:
+        description: '挂在被改动过的轮子上的本地版本段（6.8.3 → 6.8.3+codecs）。留空则不挂；挂着它，索引里同时有官方包时解析器也会确定地选我们的'
+        type: string
+        default: 'codecs'
+      new_file_owner:
+        description: '运行时里有、上游轮子里都没有的新文件归哪个发行版（留空 = 遇到就失败）。上游加了新文件时才需要填'
         type: string
         default: ''
       python_version:
@@ -74,9 +90,13 @@ concurrency:
 env:
   PYSIDE_VERSION: ${{ inputs.pyside_version }}
   WEBENGINE_TAG: ${{ inputs.webengine_tag != '' && inputs.webengine_tag || format('qtwebengine-{0}-win64-msvc2022-codecs', inputs.pyside_version) }}
+  RELEASE_TAG: ${{ inputs.release_tag != '' && inputs.release_tag || format('pyside6-{0}-win64-msvc2022-codecs', inputs.pyside_version) }}
   RUNTIME_DIR: dist/runtime
   UPSTREAM_DIR: dist/upstream
   WHEELS_DIR: dist/wheels
+  PUBLISH_DIR: dist/publish
+  UPSTREAM_MANIFEST: dist/upstream-manifest.json
+  INJECT_MANIFEST: dist/inject-manifest.json
 
 jobs:
   wheels:
@@ -133,7 +153,8 @@ jobs:
       - name: 取官方 PySide6 轮子（PyPI，带摘要核对）
         shell: pwsh
         run: |
-          python -u -X utf8 scripts/pyside6/fetch-pyside6-wheels.py -Version $env:PYSIDE_VERSION -Destination $env:UPSTREAM_DIR
+          python -u -X utf8 scripts/pyside6/fetch-pyside6-wheels.py `
+            -Version $env:PYSIDE_VERSION -Destination $env:UPSTREAM_DIR -Manifest $env:UPSTREAM_MANIFEST
           if ($LASTEXITCODE -ne 0) { throw '取官方轮子失败' }
 
       - name: 注入运行时（重算 RECORD 并逐个自证）
@@ -142,36 +163,33 @@ jobs:
           $zip = Join-Path $env:RUNTIME_DIR "qtwebengine-$env:PYSIDE_VERSION-win64-msvc2022-codecs.zip"
           python -u -X utf8 scripts/pyside6/inject-webengine-runtime.py `
             -Runtime $zip -Wheels $env:UPSTREAM_DIR -Destination $env:WHEELS_DIR `
-            -ExpectVersion $env:PYSIDE_VERSION
+            -ExpectVersion $env:PYSIDE_VERSION `
+            -LocalVersion '${{ inputs.local_version }}' `
+            -NewFileOwner '${{ inputs.new_file_owner }}' `
+            -Manifest $env:INJECT_MANIFEST
           if ($LASTEXITCODE -ne 0) { throw '注入失败' }
 
-      - name: 生成 SHA256SUMS
+      - name: 按账本挑出必须发的轮子并生成 Release 说明
         shell: pwsh
         run: |
-          $ErrorActionPreference = 'Stop'
-          $lines = Get-ChildItem -LiteralPath $env:WHEELS_DIR -Filter *.whl | Sort-Object Name | ForEach-Object {
-            '{0}  {1}' -f (Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash.ToLower(), $_.Name
-          }
-          if (-not $lines) { throw "$env:WHEELS_DIR 里没有轮子" }
-          # 行尾必须是 LF：Set-Content 在 Windows 上默认写 CRLF，而 `sha256sum -c`（Linux/macOS）
-          # 会把 CR 当成文件名的一部分，整份清单一条都核不了（实测就是这样：
-          # `'PySide6_Addons-…whl'$'\r': No such file or directory`）。写完自己查一遍，
-          # 不指望下一个人记得这件事。
-          $path = Join-Path 'dist' 'SHA256SUMS'
-          Set-Content -LiteralPath $path -Value (($lines -join "`n") + "`n") -NoNewline -Encoding ascii
-          if ([System.IO.File]::ReadAllBytes($path) -contains 13) {
-            throw 'SHA256SUMS 里混进了 CR：sha256sum -c 在 Linux/macOS 上会整份读不了'
-          }
-          $lines | Write-Host
+          # 发哪几个文件由"运行时实际改动了谁"决定，而不是这里的 glob——写死的那一刻就与规则脱钩了
+          python -u -X utf8 scripts/pyside6/stage-publish-set.py `
+            -Stage $env:WHEELS_DIR -Inject $env:INJECT_MANIFEST -Upstream $env:UPSTREAM_MANIFEST `
+            -Destination $env:PUBLISH_DIR `
+            -ReleaseUrlBase "https://github.com/$env:GITHUB_REPOSITORY/releases/download/$env:RELEASE_TAG/" `
+            -WebEngineTag $env:WEBENGINE_TAG
+          if ($LASTEXITCODE -ne 0) { throw '挑发布集合失败' }
 
       - name: 离线安装自测（一次性 venv，装完逐字节核对）
         id: wheelcheck
         shell: pwsh
         run: |
+          # 自测用的是**完整的一套**（变化的 + 从 PyPI 取来的），不是只发出去的那几个：
+          # 少发不等于可以不验，而"四个能不能一起装上"正是用户那里的第一步。
           $zip = Join-Path $env:RUNTIME_DIR "qtwebengine-$env:PYSIDE_VERSION-win64-msvc2022-codecs.zip"
           python -u -X utf8 scripts/pyside6/verify-wheels.py `
             -Runtime $zip -Wheels $env:WHEELS_DIR -Version $env:PYSIDE_VERSION
-          if ($LASTEXITCODE -ne 0) { throw '离线安装自测失败：这套轮子不能算"完整可用"' }
+          if ($LASTEXITCODE -ne 0) { throw '离线安装自测失败：这一套轮子不能算"装得上且装得对"' }
 
       - name: 汇总到作业页
         if: always()
@@ -183,11 +201,15 @@ jobs:
           $lines.Add('| 项 | 值 |')
           $lines.Add('| --- | --- |')
           $lines.Add('| 运行时来源 | ' + $env:WEBENGINE_TAG + ' |')
-          $lines.Add('| 官方轮子 | PyPI（下载时核对 sha256） |')
-          if (Test-Path -LiteralPath $env:WHEELS_DIR) {
-            foreach ($f in Get-ChildItem -LiteralPath $env:WHEELS_DIR -Filter *.whl | Sort-Object Name) {
-              $sha = (Get-FileHash -LiteralPath $f.FullName -Algorithm SHA256).Hash.ToLower()
-              $lines.Add(('| {0} | {1:N1} MB · `{2}` |' -f $f.Name, ($f.Length / 1MB), $sha))
+          $lines.Add('| 官方轮子 | PyPI（按 requires_dist 推闭包，下载时核对 sha256） |')
+          $manifest = Join-Path $env:PUBLISH_DIR 'MANIFEST.json'
+          if (Test-Path -LiteralPath $manifest) {
+            $data = Get-Content -LiteralPath $manifest -Raw | ConvertFrom-Json
+            foreach ($w in $data.published) {
+              $lines.Add(('| 发布 {0} | {1} · 改动 {2} 项 · `{3}` |' -f $w.name, $w.version, ($w.replaced + $w.added), $w.sha256))
+            }
+            foreach ($w in $data.unchanged_from_upstream) {
+              $lines.Add(('| 未上架（与上游逐字节相同） | {0} {1} |' -f $w.name, $w.version))
             }
           } else {
             $lines.Add('| 产物 | 未生成 |')
@@ -201,7 +223,8 @@ jobs:
           name: pyside6-${{ inputs.pyside_version }}-win64-msvc2022-codecs-wheels
           path: |
             dist/wheels/*.whl
-            dist/SHA256SUMS
+            dist/publish/*
+            dist/*-manifest.json
           if-no-files-found: warn
           retention-days: 30
 
@@ -210,50 +233,12 @@ jobs:
         if: ${{ success() && steps.wheelcheck.outcome == 'success' && inputs.create_release }}
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ inputs.release_tag != '' && inputs.release_tag || format('pyside6-{0}-win64-msvc2022-codecs', inputs.pyside_version) }}
+          tag_name: ${{ env.RELEASE_TAG }}
           name: ${{ format('PySide6 {0} · Windows x64 · MSVC 2022 · H.264/AAC', inputs.pyside_version) }}
-          body: |
-            可以直接 `pip install` 的 PySide6 ${{ inputs.pyside_version }}（Windows x64）：QtWebEngine
-            换成了本仓库自建的、带私有编解码器（H.264/AAC/MP3）的运行时，其余部分与 PyPI 上
-            官方轮子一致。
-
-            ## 装
-
-            ```bash
-            pip install --no-index --find-links . PySide6==${{ inputs.pyside_version }}
-            ```
-
-            四个轮子（shiboken6 / PySide6-Essentials / PySide6-Addons / PySide6）要放在同一个目录里，
-            `SHA256SUMS` 是这套轮子的摘要清单（`sha256sum -c SHA256SUMS` 可直接核）。装一个改过的
-            Addons 去配 PyPI 上的 Essentials 也能跑，但版本必须严格对齐——错配是运行期崩溃，
-            不是加载期报错。
-
-            ## 里面改了什么
-
-            运行时的 64 个文件按位置覆盖进官方轮子：
-
-            | 轮子 | 覆盖的位置 |
-            | --- | --- |
-            | PySide6-Addons | `Qt6WebEngineCore.dll`、`QtWebEngineProcess.exe`、Widgets/Quick 的 DLL、`resources/*.pak`、`translations/qtwebengine_locales/*.pak` |
-            | PySide6-Essentials | `resources/icudtl.dat` |
-
-            与上游逐字节相同的轮子**原样透传**，没有重新打包——它们的 sha256 与 PyPI 上一致，
-            可以独立核对。每个轮子的 RECORD 都按新内容重算过，`pip uninstall` 不会留垃圾。
-
-            想让产出与这里的 `SHA256SUMS` 逐字节对上，用同一个 Python 版本重打
-            （`python_version`，这里是 3.12）：换解释器只影响容器那层 deflate 字节，内容不变。
-
-            ## 运行时来源与口径
-
-            运行时取自本仓库的 Release `${{ inputs.webengine_tag != '' && inputs.webengine_tag || format('qtwebengine-{0}-win64-msvc2022-codecs', inputs.pyside_version) }}`，
-            由 `build-qtwebengine` 用 `-webengine-proprietary-codecs` 从 Qt 源码编出。
-
-            本流水线保证的是**打包正确**（摘要核对、RECORD 自洽、离线装得上、落地字节一致），
-            **不验**产物里的编解码器是否真的生效——那是浏览器里的事。
-          files: |
-            dist/wheels/*.whl
-            dist/SHA256SUMS
+          # 正文是**生成**的：文件名、改动项、安装命令都来自实际产物，不是手写文案
+          body_path: dist/publish/RELEASE_NOTES.md
+          files: dist/publish/*
           fail_on_unmatched_files: true
-          # 同一版本重打一次就更新同一个 tag：默认标签是 pyside6-<版本>-win64-msvc2022-codecs，
-          # 第二次发布时 tag 已存在，overwrite_files 保证同名资产被替换而不是报 already_exists 判红。
+          # 同一版本重打一次就更新同一个 tag：第二次发布时 tag 已存在，
+          # overwrite_files 保证同名资产被替换而不是报 already_exists 判红。
           overwrite_files: true

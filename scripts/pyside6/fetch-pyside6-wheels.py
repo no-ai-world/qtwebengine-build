@@ -4,19 +4,26 @@
 这条流水线不再自己编译任何东西：它拿本仓库 **已经发布** 的 QtWebEngine 运行时去替换官方
 轮子里的同名文件。所以第一步是把官方轮子原封不动地取下来——原封不动是有要求的，见下。
 
+**取哪几个发行版是推出来的，不是写死的**：PySide6 在 PyPI 上是一个发行版族，谁是"一套"由
+`PySide6==<版本>` 自己的 `requires_dist` 决定（实测 6.8.3 是 shiboken6 / PySide6-Essentials /
+PySide6-Addons，再加上元包自己）。写死清单的话，上游一旦调整拆分方式（历史上就调整过：
+WebEngine 曾经在 Essentials 里）就会出现"取漏了一个，而注入阶段才发现某个文件谁都认领不到"。
+`-Packages` 是逃生口：上游结构真的变了、或者要额外取一个包时用它覆盖。
+
 为什么要自己解析 PyPI 的 JSON 而不是 `pip download`：
 
-  * 要的是**精确的四个轮子**（shiboken6 / PySide6-Essentials / PySide6-Addons / PySide6），
-    不是一个由解析器算出来的闭包。少一个，"完整的一套"就不成立——用户 `pip install
-    PySide6==6.8.3 --no-index --find-links <Release>` 会因为缺依赖而直接失败；
-  * `pip download` 的 --platform/--abi 组合是一堆容易写错的开关（写错的表现是解析器
-    悄悄去拿别的变体或者干脆报"找不到匹配分发"，而不是明确地说"没有 win_amd64"）；
+  * 要的是**精确的那一套**，不是一个由解析器算出来的闭包。`pip download` 的
+    `--platform/--abi/--python-version` 是一堆容易写错的开关（写错的表现是解析器悄悄去拿
+    别的变体或者报"找不到匹配分发"，而不是明确地说"没有 win_amd64"）；
   * PyPI 的 JSON 里带着每个文件的 sha256，可以下载后立刻核对。轮子是我们唯一的输入，
     输入被人换掉这件事必须在几秒钟内暴露，而不是在用户装完之后。
 
 平台/ABI 是筛出来的，不是猜出来的：只认文件名以 `-<platform>.whl` 结尾的那个文件。
 每个包在当前版本下必须**恰好**有一个这样的文件——0 个（没有这个平台）和 ≥2 个
 （不知道该选哪个）都直接失败，不做"挑第一个"这种静默选择。
+
+`-Manifest` 会写出这一步的账（每个包：文件名 / URL / sha256），后面的"只发改动过的轮子"与
+Release 说明都从这份账里生成——发出去的东西由实际产物决定，不由手写的文案决定。
 
 用法：
     python fetch-pyside6-wheels.py -Version 6.8.3 -Destination wheels/
@@ -28,24 +35,23 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import re
 import sys
 import urllib.error
 import urllib.request
 from pathlib import Path
 
-# PyPI 的**项目名**（带连字符）。轮子文件名里是下划线，这是上游的命名，不要"修正"。
-DEFAULT_PACKAGES = (
-    "shiboken6",
-    "PySide6-Essentials",
-    "PySide6-Addons",
-    "PySide6",
-)
+# "一套 PySide6"从哪个发行版开始推。上游的元包就叫这个名字。
+ROOT_PACKAGE = "PySide6"
 
 # PyPI 会拒掉没有 User-Agent 的请求，也给一句可读的来源标识，便于上游排查流量。
 USER_AGENT = "qtwebengine-build/1.0 (+https://github.com/no-ai-world/qtwebengine-build)"
 
 DEFAULT_INDEX = "https://pypi.org/pypi"
 CHUNK = 1 << 20
+
+# `shiboken6==6.8.3` / `PySide6-Essentials==6.8.3` 这种精确钉住版本的依赖
+PINNED_DEP_RE = re.compile(r"^\s*([A-Za-z0-9][A-Za-z0-9._-]*)\s*==\s*([^\s,;]+)\s*$")
 
 
 def log(msg: str) -> None:
@@ -119,6 +125,29 @@ def pick_file(release: dict, package: str, version: str, platform: str) -> dict:
     )
 
 
+def resolve_packages(index: str, version: str, timeout: float) -> tuple[list[str], str]:
+    """推出"一套 PySide6"包含哪些发行版，返回 (项目名列表, 依据说明)。
+
+    依据是 `PySide6==<版本>` 自己的 `requires_dist` 里那些**精确钉住同一个版本**的依赖。
+    只看 `==`、且版本相同、且不带 extra 标记的：可选依赖（`; extra == "..."`）不属于默认安装。
+    一条都推不出来时返回空列表让调用方失败——静默退化成一个"只取元包"的清单，后果是注入阶段
+    才发现某个文件谁都认领不到，那时已经把时间花掉了。
+    """
+    url = f"{index}/{ROOT_PACKAGE}/{version}/json"
+    data = json.loads(http_get(url, timeout).decode("utf-8"))
+    info = data.get("info") or {}
+    names = {ROOT_PACKAGE}
+    for spec in info.get("requires_dist") or []:
+        requirement, _, marker = str(spec).partition(";")
+        if "extra" in marker:
+            continue
+        m = PINNED_DEP_RE.match(requirement)
+        if m and m.group(2).strip() == version:
+            names.add(m.group(1))
+    how = f"{ROOT_PACKAGE}=={version} 的 requires_dist（{len(names) - 1} 个依赖 + 元包自己）"
+    return sorted(names), how
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description="fetch official PySide6 wheels from PyPI")
     ap.add_argument("-Version", required=True, help="PySide6 / Qt 版本，例如 6.8.3")
@@ -126,9 +155,15 @@ def main() -> int:
     ap.add_argument("-Platform", default="win_amd64", help="轮子的平台标签（默认 win_amd64）")
     ap.add_argument(
         "-Packages",
-        default=",".join(DEFAULT_PACKAGES),
-        help="要取的 PyPI 项目名，逗号分隔（默认四个：shiboken6 / PySide6-Essentials / "
-        "PySide6-Addons / PySide6）",
+        default="",
+        help="显式指定要取的 PyPI 项目名（逗号分隔）。留空 = 从 PySide6 的 requires_dist 推；"
+        "上游拆分方式变了、或要额外取一个包时才用它",
+    )
+    ap.add_argument(
+        "-Manifest",
+        default="",
+        help="把这一步的账写成 JSON（每个包的文件名 / URL / sha256）；"
+        "后面的发布集合与 Release 说明都从它生成",
     )
     ap.add_argument("-Index", default=DEFAULT_INDEX, help="PyPI JSON API 前缀")
     ap.add_argument("-Timeout", type=float, default=120.0, help="单次 HTTP 超时（秒）")
@@ -136,16 +171,26 @@ def main() -> int:
     use_utf8_streams()
 
     version = args.Version.strip()
-    packages = [p.strip() for p in args.Packages.split(",") if p.strip()]
+    index = args.Index.rstrip("/")
+    if args.Packages.strip():
+        packages = [p.strip() for p in args.Packages.split(",") if p.strip()]
+        how = "-Packages 显式指定"
+    else:
+        try:
+            packages, how = resolve_packages(index, version, args.Timeout)
+        except Exception as exc:  # noqa: BLE001
+            log(f"[fetch] 推不出一套 PySide6 的构成：{exc}")
+            return 1
     if not packages:
-        log("[fetch] -Packages 是空的")
+        log("[fetch] 要取的发行版清单是空的")
         return 1
+    log(f"[fetch] 一套 {version} = {', '.join(packages)}（依据：{how}）")
 
     destination = Path(args.Destination)
     destination.mkdir(parents=True, exist_ok=True)
-    index = args.Index.rstrip("/")
 
     failures: list[str] = []
+    manifest: list[dict[str, str]] = []
     for package in packages:
         url = f"{index}/{package}/{version}/json"
         try:
@@ -169,22 +214,47 @@ def main() -> int:
             continue
 
         target = destination / str(chosen["filename"])
+        got = expect
         if target.is_file():
             got = hashlib.sha256(target.read_bytes()).hexdigest()
             if got == expect:
                 log(f"[fetch] {target.name}  已存在且 sha256 一致，跳过下载")
+            else:
+                log(f"[fetch] {target.name}  已存在但 sha256 不一致，重新下载")
+                try:
+                    got = download(str(chosen["url"]), target, args.Timeout, expect)
+                except Exception as exc:  # noqa: BLE001
+                    failures.append(f"{package} {version}: 下载 {chosen['filename']} 失败：{exc}")
+                    continue
+        else:
+            try:
+                got = download(str(chosen["url"]), target, args.Timeout, expect)
+            except Exception as exc:  # noqa: BLE001
+                failures.append(f"{package} {version}: 下载 {chosen['filename']} 失败：{exc}")
                 continue
-            log(f"[fetch] {target.name}  已存在但 sha256 不一致，重新下载")
 
-        try:
-            download(str(chosen["url"]), target, args.Timeout, expect)
-        except Exception as exc:  # noqa: BLE001
-            failures.append(f"{package} {version}: 下载 {chosen['filename']} 失败：{exc}")
+        manifest.append(
+            {
+                "name": package,
+                "filename": str(chosen["filename"]),
+                "url": str(chosen["url"]),
+                "sha256": got,
+            }
+        )
 
     if failures:
         for f in failures:
             log(f"[fetch] 失败：{f}")
         return 1
+
+    if args.Manifest:
+        # 名单按项目名排序，两次跑出来的账要一致
+        payload = {"version": version, "platform": args.Platform, "how": how, "packages": manifest}
+        Path(args.Manifest).write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        log(f"[fetch] 账本：{args.Manifest}")
 
     wheels = sorted(p for p in destination.glob("*.whl") if p.is_file())
     log(f"[fetch] 完成：{len(wheels)} 个轮子 → {args.Destination}")

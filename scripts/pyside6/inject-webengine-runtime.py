@@ -39,6 +39,7 @@ from __future__ import annotations
 import argparse
 import base64
 import hashlib
+import json
 import shutil
 import sys
 import zipfile
@@ -189,20 +190,65 @@ def same_bytes(zf: zipfile.ZipFile, target: str, runtime: Runtime, name: str) ->
                 return True
 
 
+def wheel_name_version(filename: str) -> tuple[str, str]:
+    """`PySide6_Addons-6.8.3-cp39-abi3-win_amd64.whl` → ("PySide6_Addons", "6.8.3")。
+
+    轮子文件名的字段是 `发行版-版本(-构建号)?-python-abi-平台.whl`，发行版里的 `-` 在文件名里
+    写成 `_`，所以前两个字段就是这两个值。
+    """
+    parts = filename.split("-")
+    if len(parts) < 5:
+        raise RuntimeError(f"{filename}: 不像一个轮子文件名")
+    return parts[0], parts[1]
+
+
+def bump_local_version(text: bytes, old_version: str, new_version: str) -> bytes:
+    """把 METADATA 里的 `Version:` 行换成带本地段的版本。只改那一行。"""
+    out = []
+    for line in text.decode("utf-8").splitlines(keepends=True):
+        if line.startswith("Version:") and line.strip().split(":", 1)[1].strip() == old_version:
+            out.append(f"Version: {new_version}\n")
+        else:
+            out.append(line)
+    return "".join(out).encode("utf-8")
+
+
 def repack(
     src: Path,
     dst: Path,
     runtime: Runtime,
     replaces: dict[str, str],
     additions: dict[str, str],
-) -> dict[str, int]:
+    local_version: str = "",
+) -> dict:
     """写出注入后的轮子。
 
     逐条走上游的顺序，只换内容不换位置。目录条目照抄且不进 RECORD（PEP 427 的 RECORD 只列
     文件）——实测这几个轮子里没有目录条目，但这一条写错了在别的轮子上就是"RECORD 里多一行
     指向不存在的文件"。
+
+    `local_version` 非空时，给**这个被改动过的**轮子挂上本地版本段（`6.8.3+codecs`）：改
+    `*.dist-info/` 目录名与 METADATA 里的 `Version:`，输出文件名同时改名。这样它在任何解析器
+    眼里都比 PyPI 上的 `6.8.3` **大**，即使索引里同时有官方包也会确定地选中我们的
+    （PEP 440：说明符不带本地段时，匹配会忽略候选版本的本地段，所以 `pyside6==6.8.3` 声明的
+    `pyside6-addons==6.8.3` 依然满足）。
     """
-    stats = {"replaced": 0, "added": 0, "entries": 0, "injected_bytes": 0}
+    stats = {
+        "replaced": 0,
+        "added": 0,
+        "entries": 0,
+        "injected_bytes": 0,
+        "changed_files": [],
+        "published_name": src.name,
+    }
+    dist, upstream_version = wheel_name_version(src.name)
+    out_version = f"{upstream_version}+{local_version}" if local_version else upstream_version
+    old_prefix = f"{dist}-{upstream_version}.dist-info/"
+    new_prefix = f"{dist}-{out_version}.dist-info/"
+    stats["published_name"] = src.name.replace(
+        f"-{upstream_version}-", f"-{out_version}-", 1
+    )
+
     with zipfile.ZipFile(src) as zin:
         infos = zin.infolist()
         record_name = next((i.filename for i in infos if i.filename.endswith(RECORD_SUFFIX)), None)
@@ -214,30 +260,40 @@ def repack(
             for info in infos:
                 if info.filename == record_name:
                     continue  # RECORD 最后写
+                name = info.filename
+                if local_version and name.startswith(old_prefix):
+                    name = new_prefix + name[len(old_prefix) :]
                 if info.is_dir():
-                    zout.writestr(make_info(info, info.filename, info.date_time), b"")
+                    zout.writestr(make_info(info, name, info.date_time), b"")
                     continue
                 if info.filename in replaces:
-                    name = replaces[info.filename]
-                    with runtime.open_stream(name) as src_fh:
+                    runtime_name = replaces[info.filename]
+                    with runtime.open_stream(runtime_name) as src_fh:
                         digest, size = stream_into(
-                            zout, make_info(info, info.filename, info.date_time), src_fh, None
+                            zout, make_info(info, name, info.date_time), src_fh, None
                         )
                     stats["replaced"] += 1
+                    stats["changed_files"].append(name)
+                elif local_version and name == new_prefix + "METADATA":
+                    # 只有 METADATA 需要改内容；它很小，不必流式
+                    data = bump_local_version(zin.read(info), upstream_version, out_version)
+                    digest = record_hash(data)
+                    size = len(data)
+                    zout.writestr(make_info(info, name, info.date_time), data)
                 else:
                     with zin.open(info, "r") as src_fh:
                         digest, size = stream_into(
                             zout,
-                            make_info(info, info.filename, info.date_time),
+                            make_info(info, name, info.date_time),
                             src_fh,
                             info.file_size,
                         )
-                records.append(f"{info.filename},sha256={digest},{size}")
+                records.append(f"{name},sha256={digest},{size}")
                 stats["entries"] += 1
 
             for wheel_name in sorted(additions):
-                name = additions[wheel_name]
-                with runtime.open_stream(name) as src_fh:
+                runtime_name = additions[wheel_name]
+                with runtime.open_stream(runtime_name) as src_fh:
                     digest, size = stream_into(
                         zout, make_info(None, wheel_name, FIXED_DATE_TIME), src_fh, None
                     )
@@ -245,13 +301,18 @@ def repack(
                 records.append(f"{wheel_name},sha256={digest},{size}")
                 stats["added"] += 1
                 stats["entries"] += 1
+                stats["changed_files"].append(wheel_name)
 
-            record_info = make_info(None, record_name, FIXED_DATE_TIME)
-            zout.writestr(record_info, "".join(r + "\n" for r in records) + f"{record_name},,\n")
+            record_info = make_info(None, new_prefix + "RECORD", FIXED_DATE_TIME)
+            zout.writestr(
+                record_info, "".join(r + "\n" for r in records) + f"{record_info.filename},,\n"
+            )
 
     stats["injected_bytes"] = sum(runtime.size(n) for n in replaces.values()) + sum(
         runtime.size(n) for n in additions.values()
     )
+    stats["version"] = out_version
+    stats["distribution"] = dist
     return stats
 
 
@@ -260,7 +321,8 @@ def verify(dst: Path, runtime: Runtime, expect_files: dict[str, str]) -> list[st
 
     这一步不能省。RECORD 是我们自己重算的，一个便宜的写法错误（少写一行、base64 带了填充
     `=`、路径用了反斜杠）在 pip 那边的表现是"装完了但 uninstall 留下垃圾"或者干脆装不上，
-    而它在本机几秒钟就能查出来。
+    而它在本机几秒钟就能查出来。挂了本地版本段的轮子还要多核一件事：**文件名里的版本、
+    dist-info 目录名、METADATA 里的 Version 三者必须一致**，否则 pip 会直接拒收这个轮子。
     """
     problems: list[str] = []
     with zipfile.ZipFile(dst) as z:
@@ -269,6 +331,25 @@ def verify(dst: Path, runtime: Runtime, expect_files: dict[str, str]) -> list[st
         if record_name is None:
             return [f"{dst.name}: 产物里没有 {RECORD_SUFFIX}"]
         record = parse_record(z.read(record_name).decode("utf-8"))
+
+        # 身份一致性：文件名 / dist-info 目录 / METADATA
+        dist, version = wheel_name_version(dst.name)
+        info_prefix = f"{dist}-{version}.dist-info/"
+        if not record_name.startswith(info_prefix):
+            problems.append(
+                f"{dst.name}: dist-info 目录是 {record_name.split('/')[0]}，"
+                f"与文件名里的 {dist}-{version} 对不上"
+            )
+        metadata = f"{info_prefix}METADATA"
+        if metadata in record:
+            for line in z.read(metadata).decode("utf-8").splitlines():
+                if line.startswith("Version:"):
+                    got = line.split(":", 1)[1].strip()
+                    if got != version:
+                        problems.append(
+                            f"{dst.name}: METADATA 里写的是 {got}，文件名里是 {version}"
+                        )
+                    break
 
         seen: set[str] = set()
         for info in infos:
@@ -326,6 +407,21 @@ def main() -> int:
     ap.add_argument(
         "-ExpectVersion", default="", help="轮子文件名里必须出现的版本（例如 6.8.3）；留空不检查"
     )
+    ap.add_argument(
+        "-NewFileOwner",
+        default="",
+        help="运行时里有、但任何上游轮子里都没有对应位置的文件，归到这个发行版（例如 "
+        "PySide6_Addons）；留空则直接失败。上游加了新文件时才需要它",
+    )
+    ap.add_argument(
+        "-LocalVersion",
+        default="",
+        help="给**被改动过的**轮子挂本地版本段（例如 codecs → 6.8.3+codecs）。这样它在任何"
+        "解析器眼里都比 PyPI 上的同名同版本轮子大，索引与本地目录同时存在时也会确定地选我们的",
+    )
+    ap.add_argument(
+        "-Manifest", default="", help="把这一步的账写成 JSON（谁被改了、发出去的文件名与摘要）"
+    )
     args = ap.parse_args()
     use_utf8_streams()
 
@@ -371,11 +467,27 @@ def inject(args: argparse.Namespace, runtime: Runtime, wheels: list[Path], desti
 
     unclaimed = [n for n in runtime.names if not owners[n]]
     ambiguous = {n: [w.name for w in o] for n, o in owners.items() if len(o) > 1}
+    if unclaimed and args.NewFileOwner:
+        # 逃生口：上游加了运行时里有的新文件——归属是数据（-NewFileOwner），不是改代码
+        target = next(
+            (w for w in wheels if wheel_name_version(w.name)[0] == args.NewFileOwner), None
+        )
+        if target is None:
+            log(
+                f"[inject] -NewFileOwner {args.NewFileOwner} 不在这一套轮子里："
+                f"{[wheel_name_version(w.name)[0] for w in wheels]}"
+            )
+            return 1
+        for name in unclaimed:
+            owners[name].append(target)
+            log(f"[inject] {name} 归属到 {args.NewFileOwner}（-NewFileOwner 指定）")
+        unclaimed = []
     if unclaimed or ambiguous:
         for name in unclaimed:
             log(
                 f"[inject] 运行时里的 {name} 在任何轮子里都没有 {args.PackageRoot}/{name} "
-                "这个位置（上游轮子布局变了？）"
+                "这个位置：上游轮子布局变了（换了一个发行版？），或者这是个新文件——"
+                "是后者就用 -NewFileOwner <发行版> 指定它归谁"
             )
         for name, ws in ambiguous.items():
             log(f"[inject] 运行时里的 {name} 同时出现在多个轮子里：{ws}")
@@ -400,22 +512,51 @@ def inject(args: argparse.Namespace, runtime: Runtime, wheels: list[Path], desti
                     replaces[target] = name
         per_wheel[wheel] = (replaces, additions, owned)
 
-    # 3. 写出并逐个自证
+    # 3. 写出并逐个自证：**只有真的变了内容的轮子才算"要发"**
     injected = 0
+    manifest: list[dict] = []
     for wheel in wheels:
         replaces, additions, owned = per_wheel[wheel]
-        dst = destination / wheel.name
         src_sha = sha256_file(wheel)
+        dist, upstream_version = wheel_name_version(wheel.name)
+        entry: dict = {
+            "name": dist,
+            "upstream_filename": wheel.name,
+            "upstream_version": upstream_version,
+            "upstream_sha256": src_sha,
+            "modified": bool(replaces or additions),
+            "owned": owned,
+            "replaced": len(replaces),
+            "added": len(additions),
+            "changed_files": sorted(set(replaces) | set(additions)),
+        }
         if not replaces and not additions:
-            shutil.copy2(wheel, dst)
+            # 原样透传：它的 sha256 与 PyPI 上一致，用户可以独立核对；不需要发这一份
+            shutil.copy2(wheel, destination / wheel.name)
+            entry.update(
+                {
+                    "published_filename": wheel.name,
+                    "published_version": upstream_version,
+                    "published_sha256": src_sha,
+                }
+            )
+            manifest.append(entry)
             log(
                 f"[inject] {wheel.name}\n"
-                f"         认领 {owned} 个位置，全部与上游逐字节相同 → 原样透传，产物与上游一致\n"
+                f"         认领 {owned} 个位置，全部与上游逐字节相同 → 原样透传（不需要发这一份）\n"
                 f"         sha256={src_sha}"
             )
             continue
+        published = (
+            wheel.name.replace(
+                f"-{upstream_version}-", f"-{upstream_version}+{args.LocalVersion}-", 1
+            )
+            if args.LocalVersion
+            else wheel.name
+        )
+        dst = destination / published
         try:
-            stats = repack(wheel, dst, runtime, replaces, additions)
+            stats = repack(wheel, dst, runtime, replaces, additions, args.LocalVersion)
         except RuntimeError as exc:
             log(f"[inject] 打包 {wheel.name} 失败：{exc}")
             return 1
@@ -425,12 +566,21 @@ def inject(args: argparse.Namespace, runtime: Runtime, wheels: list[Path], desti
             for c in checks:
                 log(f"[inject] 校验失败：{c}")
             return 1
+        entry.update(
+            {
+                "published_filename": published,
+                "published_version": stats["version"],
+                "published_sha256": sha256_file(dst),
+            }
+        )
+        manifest.append(entry)
         log(
             f"[inject] {wheel.name}\n"
             f"         认领 {owned} 个位置：替换 {stats['replaced']} 项 / 新增 {stats['added']} 项"
-            f" / 共 {stats['entries']} 项\n"
+            f" / 共 {stats['entries']} 项 → 必须发这一份\n"
             f"         上游 sha256={src_sha}\n"
-            f"         产物 sha256={sha256_file(dst)}"
+            f"         产物 {published}\n"
+            f"         产物 sha256={entry['published_sha256']}"
         )
 
     if not injected:
@@ -449,8 +599,22 @@ def inject(args: argparse.Namespace, runtime: Runtime, wheels: list[Path], desti
 
     log(
         f"[inject] 完成：{len(wheels)} 个轮子 → {args.Destination}"
-        f"（注入 {injected} 个，透传 {len(wheels) - injected} 个）"
+        f"（内容有变化、必须发的 {injected} 个；与上游逐字节相同、可不上架的 {len(wheels) - injected} 个）"
     )
+    if args.Manifest:
+        payload = {
+            "version": args.ExpectVersion or None,
+            "local_version": args.LocalVersion,
+            "wheels": manifest,
+            "must_publish": [
+                e["published_filename"] for e in manifest if e["modified"]
+            ],
+        }
+        Path(args.Manifest).write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        log(f"[inject] 账本：{args.Manifest}")
     return 0
 
 

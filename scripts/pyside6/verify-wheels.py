@@ -30,7 +30,6 @@ import zipfile
 from pathlib import Path
 
 CHUNK = 1 << 20
-EXPECTED_DISTRIBUTIONS = ("shiboken6", "PySide6_Essentials", "PySide6_Addons", "PySide6")
 
 
 def log(msg: str) -> None:
@@ -56,6 +55,12 @@ def wheel_distribution(path: Path) -> str:
     的事，而且 PyPI 的项目名与文件名本来就差这一个字符。
     """
     return path.name.split("-")[0]
+
+
+def wheel_file_version(filename: str) -> str:
+    """轮子文件名的第二个字段就是版本（`PySide6_Addons-6.8.3+codecs-…` → `6.8.3+codecs`）。"""
+    parts = filename.split("-")
+    return parts[1] if len(parts) > 1 else ""
 
 
 class Runtime:
@@ -191,17 +196,18 @@ def main() -> int:
         return 1
 
     version = args.Version
-    distributions = {wheel_distribution(w) for w in wheels}
-    missing = [d for d in EXPECTED_DISTRIBUTIONS if d not in distributions]
-    if missing:
-        # 这一条不必等 pip 去发现：缺一个就说明这一套不完整，而 pip 的报错会绕一圈
-        # （"Could not find a version that satisfies the requirement ..."）。
-        log(f"[verify] 这一套轮子缺了：{missing}（现有 {sorted(distributions)}）")
-        return 1
-    wrong_version = [w.name for w in wheels if w.name.split("-")[1:2] != [version]]
+    # 版本检查允许本地版本段：被改动过的轮子会挂 `+codecs`（`6.8.3+codecs` 依然是这一版）。
+    wrong_version = [
+        w.name
+        for w in wheels
+        if wheel_file_version(w.name) != version and not wheel_file_version(w.name).startswith(f"{version}+")
+    ]
     if wrong_version:
-        log(f"[verify] 这些轮子的版本不是 {version}：{wrong_version}")
+        log(f"[verify] 这些轮子的版本不是 {version}[+本地段]：{wrong_version}")
         return 1
+    # "完整的一套"不用写死的清单判断：下面用 `--no-index --find-links` 装一次，
+    # 少任何一个发行版都会在**那里**变成硬失败（缺哪个由解析器报出来）。写死清单的代价是：
+    # 上游一旦调整拆分方式（WebEngine 曾经在 Essentials 里），那份清单就成了假的判据。
 
     runtime = Runtime(runtime_path)
     log(f"[verify] 运行时 {runtime_path}（{len(runtime.names)} 个文件）→ 离线装进一次性 venv")
@@ -213,8 +219,12 @@ def main() -> int:
         # 先量一下要用来建 venv 的解释器：PySide6 6.8.3 的 requires-python 是 <3.14，
         # 用一个装不了它的解释器去建 venv，pip 的报错是 "requires a different Python:
         # 3.14.7 not in '<3.14,>=3.9'"，离"我该换解释器"还有一段距离。
-        meta_wheel = next((w for w in wheels if wheel_distribution(w) == "PySide6"), None)
-        spec = requires_python(meta_wheel) if meta_wheel else ""
+        # Requires-Python 从任意一个轮子的元数据里读（上游每个轮子都写了这一行）。
+        spec = ""
+        for w in wheels:
+            spec = requires_python(w)
+            if spec:
+                break
         code, out = run(
             [python_exe, "-c", "import sys; print('%d.%d' % sys.version_info[:2])"], 120
         )
@@ -291,8 +301,11 @@ def main() -> int:
         else:
             for line in out.strip().splitlines():
                 name, _, got = line.partition("\t")
-                if got.strip() != version:
-                    failures.append(f"{name} 的元数据版本是 {got.strip()!r}，期望 {version!r}")
+                # 被改动过的那个挂了本地版本段（6.8.3+codecs），它依然是这一版
+                if got.strip() != version and not got.strip().startswith(f"{version}+"):
+                    failures.append(
+                        f"{name} 的元数据版本是 {got.strip()!r}，期望 {version!r}[+本地段]"
+                    )
                 else:
                     log(f"[verify] 已安装 {name}=={got.strip()}")
     finally:
