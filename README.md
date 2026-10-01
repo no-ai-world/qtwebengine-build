@@ -12,7 +12,7 @@
 | 运行时 | `qtwebengine-<版本>-win64-msvc2022-codecs.zip` + `.sha256` |
 | 运行时内容 | `Qt6WebEngineCore.dll`、`QtWebEngineProcess.exe`、`Qt6WebEngineWidgets/Quick*.dll`、`resources/`、`translations/qtwebengine_locales/` |
 | 运行时去向 | 编译成功（`state=ok`）自动发 Release，标签 `qtwebengine-<版本>-win64-msvc2022-codecs` |
-| 轮子 | `shiboken6`、`PySide6-Essentials`、`PySide6-Addons`、`PySide6` + `SHA256SUMS`（后打的，用的是上面那份运行时） |
+| 轮子 | **只发被运行时实际改动过的那些**（实测 6.8.3 = 一个 `PySide6-Addons`）+ `SHA256SUMS` + `MANIFEST.json`；其余发行版与 PyPI 逐字节相同，从 PyPI 解析 |
 | 轮子去向 | 打包与离线安装自测都通过后发 Release，标签 `pyside6-<版本>-win64-msvc2022-codecs` |
 
 ## 跑一轮
@@ -37,11 +37,15 @@ gh workflow run build-pyside6-wheels.yml --repo <owner>/qtwebengine-build \
 
 ## 用产物
 
-打轮子那条路（推荐）：
+打轮子那条路（推荐，命令由 Release 说明按实际产物生成）：
 
 ```bash
-pip install --no-index --find-links <放四个轮子的目录> PySide6==6.8.3
+uv add "pyside6==6.8.3" "PySide6-Addons @ <Release 里的直链>"
+# pip 同形
 ```
+
+**版本必须钉死**（运行时只对 Qt 6.8.3 有效），只有被改动的那一个包用直链，其余自动从 PyPI
+拿。为什么钉版本、为什么直链、装完怎么确认，见 [打包 PySide6 轮子](docs/wheels.md#装)。
 
 手动铺运行时那条路：解压 zip，把内容覆盖进目标 PySide6 安装目录的 `PySide6\` 下（同名文件直接替换）：
 
@@ -75,9 +79,10 @@ scripts/qtwebengine/
   watch-build.py                           构建阶段看门狗（进度/静默/内存/缓存接线 + check run 心跳）
   stage-webengine-runtime.py               打包：把安装前缀铺成待分发目录（zip 的来源）
 scripts/pyside6/
-  fetch-pyside6-wheels.py                  从 PyPI 取官方轮子（核对每个文件的 sha256）
-  inject-webengine-runtime.py              把运行时注入轮子（重算 RECORD + 产出后自证）
-  verify-wheels.py                         离线装进一次性 venv，逐字节核对落地文件
+  fetch-pyside6-wheels.py                  从 PyPI 取官方轮子（闭包由 requires_dist 推，核对 sha256）
+  inject-webengine-runtime.py              把运行时注入轮子（重算 RECORD + 产出后自证 + 写账本）
+  stage-publish-set.py                     按账本挑出"必须发"的轮子，并生成 Release 说明
+  verify-wheels.py                         完整一套离线装进一次性 venv，逐字节核对落地文件
 ```
 
 ## 文档

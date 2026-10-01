@@ -14,28 +14,38 @@ workflow 里仍有约 450 行内联 `pwsh`（预检、页面文件、缓存下�
 | `check-ccache-bound.py` | prepare 阶段证明缓存已接线（跑 GN 生成 + 扫 ninja 规则） | `:run_py` | **0 / 1 / 2 / 3**，见下 |
 | `watch-build.py` | 构建阶段看门狗：进度/静默/内存/缓存接线 + 哨兵 + 心跳 | workflow 直接启动 | 不判红（被杀掉即结束） |
 | `stage-webengine-runtime.py` | 把安装前缀铺成待分发目录（zip 的来源） | `:run_py` | 0 / 1 |
-| `fetch-pyside6-wheels.py` | 从 PyPI 取官方 PySide6 轮子（逐文件核对 sha256） | 轮子 workflow | 0 / 1 |
-| `inject-webengine-runtime.py` | 把运行时注入轮子（重算 RECORD，产出后自证） | 轮子 workflow | 0 / 1 |
-| `verify-wheels.py` | 离线装进一次性 venv，逐字节核对落地文件 | 轮子 workflow | 0 / 1 |
+| `fetch-pyside6-wheels.py` | 从 PyPI 取官方 PySide6 轮子（闭包由 `requires_dist` 推，逐文件核对 sha256） | 轮子 workflow | 0 / 1 |
+| `inject-webengine-runtime.py` | 把运行时注入轮子（重算 RECORD，产出后自证，写账本） | 轮子 workflow | 0 / 1 |
+| `stage-publish-set.py` | 按账本挑出"必须发"的轮子，生成 `SHA256SUMS` / `MANIFEST.json` / Release 说明 | 轮子 workflow | 0 / 1 |
+| `verify-wheels.py` | 完整一套离线装进一次性 venv，逐字节核对落地文件 | 轮子 workflow | 0 / 1 |
 
 补丁类脚本都是**幂等**的：目标已经是期望形态时不重写文件，重复跑不会插出第二段。
 
-## 轮子流水线那三个脚本的契约
+## 轮子流水线那四个脚本的契约
 
-这三个脚本决定的是**发出去的东西**，所以它们宁可失败也不做"看起来成功"的事：
+这四个脚本决定的是**发出去的东西**，所以它们宁可失败也不做"看起来成功"的事。核心是一条规则：
 
-* `fetch-pyside6-wheels.py` 只认文件名以 `-<平台>.whl` 结尾的那个文件，且每个包在该版本下
-  必须**恰好有一个**：0 个（没有这个平台）与 ≥2 个（不知道该选哪个）都直接失败，不做"挑第一个"。
-  下载边下边算 sha256 并比对 PyPI JSON 里给出的摘要，不匹配就把半成品删掉；
-* `inject-webengine-runtime.py` 的映射是**推出来的**：运行时里每个相对路径去每个轮子里找
-  `<包根>/<相对路径>`，必须恰好命中一个轮子。0 个、≥2 个、以及"一个字节都没变"（那说明这份
-  运行时是多余的）都算失败。重新打包时逐条重算 RECORD，产出后**重新打开产物**核对摘要与
-  注入内容；一个字节都没变的轮子原样透传（否则它的 sha256 会与 PyPI 对不上，用户就失去了
-  独立核对的手段）；
-* `verify-wheels.py` 用 `--no-index --find-links` 装一次：任何轮子缺席都会在这里变成硬失败，
-  而不是等用户在 pip 那里撞见。它先量一下要用的解释器（PySide6 6.8.3 要求 `>=3.9,<3.14`），
-  免得把"解释器不对"报成"轮子装不上"。刻意**不 import** PySide6、不看页面能不能放 H.264——
-  那是浏览器里的事。
+> **某个轮子必须发 ⟺ 我们的运行时实际改动了它的内容。**
+
+* `fetch-pyside6-wheels.py`：取哪几个发行版是**推出来的**（`PySide6==<版本>` 的
+  `requires_dist` 里那些精确钉住同版本的依赖 + 元包自己），不是写死的清单——写死的话上游一
+  调整拆分方式（WebEngine 曾经在 Essentials 里），清单就成了假判据。平台/ABI 是筛出来的：
+  只认文件名以 `-<平台>.whl` 结尾的那个文件，每个包必须**恰好一个**（0 个与 ≥2 个都失败）。
+  下载边下边算 sha256 并比对 PyPI 给的摘要，不匹配就把半成品删掉；`-Manifest` 写出账本。
+* `inject-webengine-runtime.py`：映射是推出来的——运行时里每个相对路径去每个轮子里找
+  `<包根>/<相对路径>`，必须恰好命中一个轮子。0 个（上游布局变了，或是个新文件：用
+  `-NewFileOwner <发行版>` 指定归属，这是**数据**不是代码改动）、≥2 个、以及"一个字节都没变"
+  （那说明这份运行时是多余的）都算失败。重新打包时逐条重算 RECORD，产出后**重新打开产物**
+  核对摘要与注入内容；挂了 `-LocalVersion`（例如 `codecs`）的还要核"文件名 / dist-info /
+  METADATA 三者版本一致"，否则 pip 会直接拒收。一个字节都没变的轮子原样透传。
+* `stage-publish-set.py`：从账本里读出"谁被改了"，**只把那些**拷进发布目录，并生成
+  `SHA256SUMS`（只有实际发出去的文件，行尾 LF）、`MANIFEST.json`（含从 PyPI 解析的那几份的
+  URL 与摘要）与 `RELEASE_NOTES.md`（Release 正文）。正文是**生成**的：文件名、改动项、
+  安装命令都来自实际产物——手写文案会与产物漂移，漂了用户照说明装出来的就不是这里发的那个。
+* `verify-wheels.py`：用 `--no-index --find-links` 装一次。**"这一套完不完整"由这次安装判断**
+  （少任何一个发行版都会在这里硬失败），不再有写死的发行版清单。它先量一下要用的解释器
+  （PySide6 6.8.3 要求 `>=3.9,<3.14`），免得把"解释器不对"报成"轮子装不上"。刻意**不 import**
+  PySide6、不看页面能不能放 H.264——那是浏览器里的事。
 
 ## `check-ccache-bound.py` 的退出码是契约
 
@@ -102,13 +112,17 @@ python scripts/check-pipeline.py
 （判据是调用而不是「注释里提到」——build.cmd 与 workflow 的注释、报错文案里都写着脚本名）、
 每个 Python 脚本能否编译、build.cmd 有没有单独处理退出码 3、build.cmd 有没有占用 `RC` 这个名字，
 以及 `auto_continue` 的预检步是否真的 `throw`（秘密缺失必须在几秒内失败，而不是轮末才发现）。
-轮子流水线另有五条：运行时必须**从已有 Release 取**（`gh release download` 用 `WEBENGINE_TAG`，
-不许出现 `build.cmd`）、"完整一套"的四个发行版要落在脚本的清单里、离线安装自测必须在发布步
-之前**真的跑过**（判据是发布步引用 `steps.wheelcheck.outcome`，而不是全文里有没有 `--no-index`
-——发布说明的正文里就写着那条 pip 命令）、发布步要保留 `overwrite_files` 与
-`fail_on_unmatched_files`，以及**每一处启动脚本的调用行都要带 `-u -X utf8`**（真踩过：run
-36806802921 里取轮子那一步打印"完成：4 个轮子"时抛 `UnicodeEncodeError`，因为 CI 把输出接进
-管道、locale 是 cp1252，而四个轮子其实都已经下好了）。其余检查项见
+轮子流水线另有六条：运行时必须**从已有 Release 取**（`gh release download` 用 `WEBENGINE_TAG`，
+不许出现 `build.cmd`）；一套的构成必须**从 `requires_dist` 推**（不许写死清单）、且 fetch 要写账本；
+注入脚本要能挂本地版本段、要有新文件归属的逃生口、要写账本；**发布步必须发暂存集合
+（`files: dist/publish/*`）而不是 `dist/wheels` 全部**，且挑集合那一步排在发布之前、正文用
+`body_path`（生成的，不是手写）；离线安装自测必须在发布步之前**真的跑过**（判据是发布步引用
+`steps.wheelcheck.outcome`，而不是全文里有没有 `--no-index`——发布说明的正文里就写着那条 pip
+命令），并且那次安装必须带 `"--no-index"`（不带的解析器会去 PyPI 补齐，完整性判据静默失效；
+判据是带引号的参数形式，不是全文子串——脚本的说明里就有这两个词）；发布步要保留
+`overwrite_files` 与 `fail_on_unmatched_files`；以及**每一处启动脚本的调用行都要带 `-u -X utf8`**
+（真踩过：run 36806802921 里取轮子那一步打印"完成：4 个轮子"时抛 `UnicodeEncodeError`，因为
+CI 把输出接进管道、locale 是 cp1252，而四个轮子其实都已经下好了）。其余检查项见
 [运行与参数](run.md#派之前先自检)。
 
 ### 三个回归测试
@@ -128,7 +142,8 @@ python scripts/tests/run-py-integration.py        # build.cmd 的 :run_py 机制
   留着，检查照样通过。
 * **打包负向测试**用几十字节的假轮子与假运行时（不联网、不需要真 PySide6）证明那几条"拒绝"
   真的会拒绝：运行时里的文件谁都认领不到、同一个位置落在两个轮子里、运行时与上游逐字节相同
-  （这份运行时是多余的）、一套轮子少一个发行版。
+  （这份运行时是多余的）、轮子版本对不上；另外把**发布规则本身**跑两遍——只改 Addons 时集合
+  只有一个，`icudtl.dat` 也变时 Essentials 自动进集合——并断言 `SHA256SUMS` 是 LF 且摘要自洽。
 * **`:run_py` 集成测试**把那个标签块从 `build.cmd` 里**逐字抽出来**再调用，所以验的是真正那条
   调用行（`python -u -X utf8 "%SCRIPT_DIR%\%~1" ...`）。harness 所在目录名故意带空格，验的
   就是那对引号；退出码透传、参数转发与 8 参数上限也一起钉住。

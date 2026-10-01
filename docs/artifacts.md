@@ -36,7 +36,10 @@
 
 ## 更省事的用法：直接装轮子
 
-同一份运行时还有一个打包好的形态：把上面的文件注入官方 PySide6 轮子之后发出来的
-**一套可直接 `pip install` 的轮子**（标签 `pyside6-<版本>-win64-msvc2022-codecs`）。
-那条流水线（`build-pyside6-wheels`）**不重新编译**，直接用这份 Release 里的 zip，
-几分钟就跑完。见 [打包 PySide6 轮子](wheels.md)。
+同一份运行时还有一个打包好的形态：把上面的文件注入官方 PySide6 轮子之后发出来的轮子
+（标签 `pyside6-<版本>-win64-msvc2022-codecs`）。那条流水线（`build-pyside6-wheels`）
+**不重新编译**，直接用这份 Release 里的 zip，几分钟就跑完。
+
+它只发**被运行时实际改动过**的轮子（实测 6.8.3 = 一个 `PySide6-Addons`），其余发行版与 PyPI
+上的原件逐字节相同，由 PyPI 解析——`MANIFEST.json` 里钉了它们的版本与摘要。见
+[打包 PySide6 轮子](wheels.md)。

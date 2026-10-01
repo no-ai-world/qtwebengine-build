@@ -92,7 +92,10 @@ python scripts/check-pipeline.py
 （CMake 把 `$ENV{RC}` 当资源编译器路径，占用它会让这道门禁每轮都答「判断不了」），以及
 `auto_continue` 的预检步是否真的 `throw`（`CACHE_TOKEN` 缺失要在几秒内失败，而不是轮末才发现）。
 
-轮子流水线（`build-pyside6-wheels.yml`）另有五条：运行时必须**从已有 Release 取**（不许出现
-`build.cmd`）、"完整一套"的四个发行版要落在脚本的清单里、离线安装自测必须在发布步之前真的跑过、
-发布步要保留 `overwrite_files` 与 `fail_on_unmatched_files`，以及每一处启动脚本的调用行都要带
-`-u -X utf8`。细节见 [脚本契约](scripts.md#这些约定由-scriptscheck-pipelinepy-守着)。
+轮子流水线（`build-pyside6-wheels.yml`）另有六条：运行时必须**从已有 Release 取**（不许出现
+`build.cmd`）；一套的构成必须从 `requires_dist` 推（不许写死清单）；注入脚本要能挂本地版本段、
+写账本、留新文件归属的逃生口；**发布步必须发暂存集合而不是整个注入目录**，且挑集合那一步在
+发布之前、正文用 `body_path`（生成的）；离线安装自测必须在发布步之前真的跑过、并且那次安装必须
+带 `--no-index`（不带就等于关掉完整性判据）；发布步要保留 `overwrite_files` 与
+`fail_on_unmatched_files`；每一处启动脚本的调用行都要带 `-u -X utf8`。细节见
+[脚本契约](scripts.md#这些约定由-scriptscheck-pipelinepy-守着)。
