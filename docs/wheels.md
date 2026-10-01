@@ -38,9 +38,74 @@ gh workflow run build-pyside6-wheels.yml --repo <owner>/qtwebengine-build \
 
 ## 装
 
+**版本必须钉住 `==6.8.3`**：运行时只对 Qt 6.8.3 有效，而不钉版本时解析器会去拿 PyPI 上最新的
+（实测 `uv add pyside6` 装的是 6.11.2，跟这份产物无关）。
+
+下面几条都是在同一套 Release 资产上实测过的（uv 0.12.11 / pip 25.0.1，判据是落地后的
+`Qt6WebEngineCore.dll`：自建 154,831,360 字节 / `d47a1923…`，官方 154,433,672 字节 / `3b5daf77…`）。
+
+### 1. 显式把 Addons 指到我们的轮子（推荐，pip 与 uv 都确定）
+
 ```bash
-pip install --no-index --find-links <放四个轮子的目录> PySide6==6.8.3
+# uv（其余三个自动从 PyPI 拿，版本由 pyside6==6.8.3 锁死）
+uv add "pyside6==6.8.3" "pyside6-addons @ https://github.com/no-ai-world/qtwebengine-build/releases/download/pyside6-6.8.3-win64-msvc2022-codecs/PySide6_Addons-6.8.3-cp39-abi3-win_amd64.whl"
+
+# pip 同形
+pip install "pyside6==6.8.3" "pyside6-addons @ <同一个直链>"
 ```
+
+`uv add` 会把它落成 pyproject 里的规范形态，之后 `uv sync` 一直是对的（lock 里记了 URL 与摘要）：
+
+```toml
+dependencies = ["pyside6==6.8.3", "pyside6-addons"]
+
+[tool.uv.sources]
+pyside6-addons = { url = "https://github.com/…/PySide6_Addons-6.8.3-cp39-abi3-win_amd64.whl" }
+```
+
+> ⚠️ **只写 `[tool.uv.sources]` 是不够的**：`sources` 只对项目的**直接依赖**生效。如果
+> `pyside6-addons` 没同时列进 `dependencies`，uv 会**静默忽略**这条 source，然后从 PyPI 装官方包
+> （第一次试就是这么翻车的，DLL 大小一眼看出不对）。
+
+### 2. 全离线：先把四个轮子下到一个目录
+
+```bash
+gh release download pyside6-6.8.3-win64-msvc2022-codecs --pattern '*' -D wheels
+uv add  "pyside6==6.8.3" --no-index --find-links wheels
+pip install "pyside6==6.8.3" --no-index --find-links wheels
+```
+
+`--no-index` 关掉索引，两个工具都确定；代价是**所有**依赖都得能从 `wheels/` 解析
+（只装 PySide6 的项目没问题，项目里还有别的依赖就别用这条）。
+
+### 3. uv 专用：`--find-links`（不带 `--no-index`）也可以
+
+```bash
+uv add "pyside6==6.8.3" --find-links wheels
+```
+
+uv 在同名同版本时**优先 flat index**，所以拿到的是我们的（实测 3/3）。想让它长期有效就写进
+pyproject，之后 `uv sync` 不带参数也对：
+
+```toml
+[tool.uv]
+find-links = ["wheels"]
+```
+
+注意 uv 的 lock 里记的是**本机绝对路径**，换机器或删掉那个目录就失效；要可复现就用第 1 条的 URL。
+
+### 4. ❌ 不要用：`pip install "pyside6==6.8.3" --find-links wheels`
+
+同名同版本时 **pip 优先索引**，实测 3/3 次（连 `--no-cache-dir` 都是）静默装成**官方包**，
+不报任何错——用户以为自己有编解码器，其实没有。pip 请用第 1 条或第 2 条。
+
+### 装完怎么确认
+
+```bash
+python -c "import sys,pathlib;print((pathlib.Path(sys.prefix)/'Lib/site-packages/PySide6/Qt6WebEngineCore.dll').stat().st_size)"
+```
+
+`154831360` = 自建（带私有编解码器）；`154433672` = 官方（装错了）。
 
 ## 里面改了什么
 
