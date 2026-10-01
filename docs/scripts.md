@@ -14,8 +14,28 @@ workflow 里仍有约 450 行内联 `pwsh`（预检、页面文件、缓存下�
 | `check-ccache-bound.py` | prepare 阶段证明缓存已接线（跑 GN 生成 + 扫 ninja 规则） | `:run_py` | **0 / 1 / 2 / 3**，见下 |
 | `watch-build.py` | 构建阶段看门狗：进度/静默/内存/缓存接线 + 哨兵 + 心跳 | workflow 直接启动 | 不判红（被杀掉即结束） |
 | `stage-webengine-runtime.py` | 把安装前缀铺成待分发目录（zip 的来源） | `:run_py` | 0 / 1 |
+| `fetch-pyside6-wheels.py` | 从 PyPI 取官方 PySide6 轮子（逐文件核对 sha256） | 轮子 workflow | 0 / 1 |
+| `inject-webengine-runtime.py` | 把运行时注入轮子（重算 RECORD，产出后自证） | 轮子 workflow | 0 / 1 |
+| `verify-wheels.py` | 离线装进一次性 venv，逐字节核对落地文件 | 轮子 workflow | 0 / 1 |
 
 补丁类脚本都是**幂等**的：目标已经是期望形态时不重写文件，重复跑不会插出第二段。
+
+## 轮子流水线那三个脚本的契约
+
+这三个脚本决定的是**发出去的东西**，所以它们宁可失败也不做"看起来成功"的事：
+
+* `fetch-pyside6-wheels.py` 只认文件名以 `-<平台>.whl` 结尾的那个文件，且每个包在该版本下
+  必须**恰好有一个**：0 个（没有这个平台）与 ≥2 个（不知道该选哪个）都直接失败，不做"挑第一个"。
+  下载边下边算 sha256 并比对 PyPI JSON 里给出的摘要，不匹配就把半成品删掉；
+* `inject-webengine-runtime.py` 的映射是**推出来的**：运行时里每个相对路径去每个轮子里找
+  `<包根>/<相对路径>`，必须恰好命中一个轮子。0 个、≥2 个、以及"一个字节都没变"（那说明这份
+  运行时是多余的）都算失败。重新打包时逐条重算 RECORD，产出后**重新打开产物**核对摘要与
+  注入内容；一个字节都没变的轮子原样透传（否则它的 sha256 会与 PyPI 对不上，用户就失去了
+  独立核对的手段）；
+* `verify-wheels.py` 用 `--no-index --find-links` 装一次：任何轮子缺席都会在这里变成硬失败，
+  而不是等用户在 pip 那里撞见。它先量一下要用的解释器（PySide6 6.8.3 要求 `>=3.9,<3.14`），
+  免得把"解释器不对"报成"轮子装不上"。刻意**不 import** PySide6、不看页面能不能放 H.264——
+  那是浏览器里的事。
 
 ## `check-ccache-bound.py` 的退出码是契约
 
@@ -78,19 +98,24 @@ python scripts/check-pipeline.py
 ```
 
 与脚本层相关的检查：`:run_py` 的参数个数（第 9 个会被无声丢掉）与 `-u`/`-X utf8`、`scripts/` 下
-有没有混回 `.ps1`、`scripts/qtwebengine/` 下每个脚本是否**真的被调用**（判据是调用而不是「注释里
-提到」——build.cmd 与 workflow 的注释、报错文案里都写着脚本名）、每个 Python 脚本能否编译、
-build.cmd 有没有单独处理退出码 3、build.cmd 有没有占用 `RC` 这个名字，以及 `auto_continue` 的
-预检步是否真的 `throw`（秘密缺失必须在几秒内失败，而不是轮末才发现）。其余检查项见
-[运行与参数](run.md#派之前先自检)。
+有没有混回 `.ps1`、`scripts/qtwebengine/` 与 `scripts/pyside6/` 下每个脚本是否**真的被调用**
+（判据是调用而不是「注释里提到」——build.cmd 与 workflow 的注释、报错文案里都写着脚本名）、
+每个 Python 脚本能否编译、build.cmd 有没有单独处理退出码 3、build.cmd 有没有占用 `RC` 这个名字，
+以及 `auto_continue` 的预检步是否真的 `throw`（秘密缺失必须在几秒内失败，而不是轮末才发现）。
+轮子流水线另有四条：运行时必须**从已有 Release 取**（`gh release download` 用 `WEBENGINE_TAG`，
+不许出现 `build.cmd`）、"完整一套"的四个发行版要落在脚本的清单里、离线安装自测必须在发布步
+之前**真的跑过**（判据是发布步引用 `steps.wheelcheck.outcome`，而不是全文里有没有 `--no-index`
+——发布说明的正文里就写着那条 pip 命令）、发布步要保留 `overwrite_files` 与
+`fail_on_unmatched_files`。其余检查项见 [运行与参数](run.md#派之前先自检)。
 
-### 两个回归测试
+### 三个回归测试
 
-一条永远不报红的检查只是装饰，所以这两条守卫自己也有测试（都在 `scripts/tests/`，用系统临时
+一条永远不报红的检查只是装饰，所以这些守卫自己也有测试（都在 `scripts/tests/`，用系统临时
 目录，不写仓库里的任何文件）：
 
 ```bash
-python scripts/tests/check-pipeline-negative.py   # 每条守卫都要能被真的破坏掉
+python scripts/tests/check-pipeline-negative.py   # 每条静态守卫都要能被真的破坏掉
+python scripts/tests/wheel-packaging-negative.py  # 打包脚本不能静默地把坏产物发出去
 python scripts/tests/run-py-integration.py        # build.cmd 的 :run_py 机制（不需要 Qt/MSVC）
 ```
 
@@ -98,6 +123,9 @@ python scripts/tests/run-py-integration.py        # build.cmd 的 :run_py 机制
   在 `-LiteralPath` 里写通配符——然后断言检查必须报红。这里每个变体都**刻意保留注释**：开发时
   两次踩到同一个坑，判据写成「全文子串」而理由注释里正好写着那个子串，于是把调用删掉、注释
   留着，检查照样通过。
+* **打包负向测试**用几十字节的假轮子与假运行时（不联网、不需要真 PySide6）证明那几条"拒绝"
+  真的会拒绝：运行时里的文件谁都认领不到、同一个位置落在两个轮子里、运行时与上游逐字节相同
+  （这份运行时是多余的）、一套轮子少一个发行版。
 * **`:run_py` 集成测试**把那个标签块从 `build.cmd` 里**逐字抽出来**再调用，所以验的是真正那条
   调用行（`python -u -X utf8 "%SCRIPT_DIR%\%~1" ...`）。harness 所在目录名故意带空格，验的
   就是那对引号；退出码透传、参数转发与 8 参数上限也一起钉住。

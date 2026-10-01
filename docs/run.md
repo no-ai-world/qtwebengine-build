@@ -12,6 +12,15 @@ gh workflow run build-qtwebengine.yml --repo <owner>/qtwebengine-build \
 一轮 4–5 小时。默认参数：Qt 6.8.3、RelWithDebInfo、只编一个配置、`symbol_level=0`、
 `use_ccache=false`（要分轮续跑就打开，见 [cache.md](cache.md)）。
 
+编出运行时之后，**不用再编**就能打一套可 `pip install` 的 PySide6 轮子（几分钟）：
+
+```bash
+gh workflow run build-pyside6-wheels.yml --repo <owner>/qtwebengine-build \
+  -f pyside_version=6.8.3
+```
+
+它直接用上面那份已经发布的运行时，参数与产物见 [打包 PySide6 轮子](wheels.md)。
+
 ## 参数
 
 | 输入 | 默认 | 说明 |
@@ -82,3 +91,8 @@ python scripts/check-pipeline.py
 分开，否则一次参数写错就静默关掉 ccache 门禁）、`build.cmd` 有没有占用 `RC` 这个环境变量名
 （CMake 把 `$ENV{RC}` 当资源编译器路径，占用它会让这道门禁每轮都答「判断不了」），以及
 `auto_continue` 的预检步是否真的 `throw`（`CACHE_TOKEN` 缺失要在几秒内失败，而不是轮末才发现）。
+
+轮子流水线（`build-pyside6-wheels.yml`）另有四条：运行时必须**从已有 Release 取**（不许出现
+`build.cmd`）、"完整一套"的四个发行版要落在脚本的清单里、离线安装自测必须在发布步之前真的跑过、
+发布步要保留 `overwrite_files` 与 `fail_on_unmatched_files`。细节见
+[脚本契约](scripts.md#这些约定由-scriptscheck-pipelinepy-守着)。
