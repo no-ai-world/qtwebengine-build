@@ -26,6 +26,7 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parents[2]
 BUILD_CMD = "scripts/qtwebengine/build.cmd"
 WORKFLOW = ".github/workflows/build-qtwebengine.yml"
+WHEEL_WORKFLOW = ".github/workflows/build-pyside6-wheels.yml"
 
 STAGE_CALL = (
     'call :run_py stage-webengine-runtime.py -Source "%INSTALL_PREFIX%" '
@@ -46,12 +47,16 @@ def make_root(workdir: Path) -> Path:
     """一份 check-pipeline.py 会读的最小仓库副本。"""
     root = workdir / "repo"
     (root / "scripts/qtwebengine").mkdir(parents=True)
+    (root / "scripts/pyside6").mkdir(parents=True)
     (root / ".github/workflows").mkdir(parents=True)
     shutil.copy2(REPO / "scripts/check-pipeline.py", root / "scripts/check-pipeline.py")
     for py in sorted((REPO / "scripts/qtwebengine").glob("*.py")):
         shutil.copy2(py, root / "scripts/qtwebengine" / py.name)
+    for py in sorted((REPO / "scripts/pyside6").glob("*.py")):
+        shutil.copy2(py, root / "scripts/pyside6" / py.name)
     shutil.copy2(REPO / BUILD_CMD, root / BUILD_CMD)
     shutil.copy2(REPO / WORKFLOW, root / WORKFLOW)
+    shutil.copy2(REPO / WHEEL_WORKFLOW, root / WHEEL_WORKFLOW)
     return root
 
 
@@ -77,6 +82,13 @@ def edit_workflow(root: Path, old: str, new: str) -> None:
     path = root / WORKFLOW
     text = path.read_text(encoding="utf-8")
     assert old in text, f"mutation target not found in workflow: {old[:60]!r}"
+    path.write_text(text.replace(old, new), encoding="utf-8")
+
+
+def edit_wheel_workflow(root: Path, old: str, new: str) -> None:
+    path = root / WHEEL_WORKFLOW
+    text = path.read_text(encoding="utf-8")
+    assert old in text, f"mutation target not found in wheel workflow: {old[:60]!r}"
     path.write_text(text.replace(old, new), encoding="utf-8")
 
 
@@ -212,6 +224,75 @@ def main() -> int:
             r,
             "throw 'auto_continue=true 但没有 CACHE_TOKEN",
             "Write-Host 'auto_continue=true 但没有 CACHE_TOKEN",
+        ),
+    )
+
+    # 轮子流水线：它存在的意义就是"别再编一遍"+"发出去的确实装得上"
+    expect(
+        "轮子流水线不再从已有 Release 取运行时（改成自己编）",
+        "没有从已有 Release 取运行时",
+        lambda r: edit_wheel_workflow(
+            r,
+            "          gh release download $env:WEBENGINE_TAG `\n",
+            "          # 取运行时那一步删掉了（注释里还写着 gh release download）\n",
+        ),
+    )
+    expect(
+        "gh release download 的标签写死（换版本会取到错的运行时）",
+        "没有用 WEBENGINE_TAG",
+        lambda r: edit_wheel_workflow(
+            r,
+            "gh release download $env:WEBENGINE_TAG `",
+            "gh release download qtwebengine-6.8.3-win64-msvc2022-codecs `",
+        ),
+    )
+    expect(
+        "注入脚本的调用整行删掉、注释保留",
+        "没有被 workflow 的非注释行实际调用",
+        lambda r: edit_wheel_workflow(
+            r,
+            "          python scripts/pyside6/inject-webengine-runtime.py `\n",
+            "          # python scripts/pyside6/inject-webengine-runtime.py 以前在这里\n",
+        ),
+    )
+    expect(
+        "离线安装自测的调用整行删掉、注释保留",
+        "verify-wheels.py 没有被 workflow 的非注释行实际调用",
+        lambda r: edit_wheel_workflow(
+            r,
+            "          python scripts/pyside6/verify-wheels.py `\n",
+            "          # python scripts/pyside6/verify-wheels.py 以前在这里\n",
+        ),
+    )
+    expect(
+        "发布步不再以离线安装自测为前置（装不上也照发）",
+        "没有以离线安装自测",
+        lambda r: edit_wheel_workflow(
+            r,
+            "if: ${{ success() && steps.wheelcheck.outcome == 'success' && inputs.create_release }}",
+            "if: ${{ success() && inputs.create_release }}",
+        ),
+    )
+    expect(
+        "发布步不再覆盖同名资产（重发会判红）",
+        "overwrite_files: true",
+        lambda r: edit_wheel_workflow(r, "overwrite_files: true", "overwrite_files: false"),
+    )
+    expect(
+        "fetch 的清单里少了一个发行版",
+        "的清单少了",
+        lambda r: (r / "scripts/pyside6/fetch-pyside6-wheels.py").write_text(
+            (r / "scripts/pyside6/fetch-pyside6-wheels.py")
+            .read_text(encoding="utf-8")
+            .replace('    "PySide6-Addons",\n', ""),
+            encoding="utf-8",
+        ),
+    )
+    expect(
+        "scripts/pyside6 下多了一个没人调用的脚本（死代码）",
+        "没有被 workflow 的非注释行实际调用",
+        lambda r: (r / "scripts/pyside6/nobody-calls-me.py").write_text(
+            "print(1)\n", encoding="utf-8"
         ),
     )
 

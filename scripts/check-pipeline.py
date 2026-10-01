@@ -23,6 +23,7 @@ from pathlib import Path
 
 BUILD_CMD = "scripts/qtwebengine/build.cmd"
 WORKFLOW = ".github/workflows/build-qtwebengine.yml"
+WHEEL_WORKFLOW = ".github/workflows/build-pyside6-wheels.yml"
 
 # 这些输入允许不被自动续跑转发：它们只影响本次运行的收尾动作或人工开关，
 # 转发与否都不改变「第二轮编出来的东西」。
@@ -274,6 +275,7 @@ def check_run_py_args(root: Path) -> None:
 # ---------------------------------------------------------------------------
 
 QTWE_DIR = "scripts/qtwebengine"
+PYSIDE6_DIR = "scripts/pyside6"
 
 
 def token_missing_branch_throws(step_body: str) -> bool:
@@ -378,6 +380,16 @@ def check_no_powershell_scripts(root: Path) -> None:
                 "migration/orphan",
                 f"{QTWE_DIR}/{path.name} 没有被 build.cmd 的 call :run_py 或 workflow 的"
                 "非注释行实际调用（死代码？）",
+            )
+
+    # 轮子流水线那一侧同理：scripts/pyside6 下的脚本只能由轮子 workflow 调起
+    wheel_workflow = read_text(root / WHEEL_WORKFLOW) if (root / WHEEL_WORKFLOW).is_file() else ""
+    wheel_called = workflow_invocations(wheel_workflow)
+    for path in sorted((root / PYSIDE6_DIR).glob("*.py")):
+        if path.name not in wheel_called and path.name not in workflow_called:
+            fail(
+                "migration/orphan",
+                f"{PYSIDE6_DIR}/{path.name} 没有被 workflow 的非注释行实际调用（死代码？）",
             )
 
 
@@ -638,6 +650,105 @@ def check_ccache_wiring(root: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
+# 轮子流水线（build-pyside6-wheels.yml）：不编译，只把**已经发布**的运行时打进官方轮子
+# ---------------------------------------------------------------------------
+
+WHEEL_SCRIPTS = ("fetch-pyside6-wheels.py", "inject-webengine-runtime.py", "verify-wheels.py")
+# 「完整一套」的四个发行版。PyPI 的项目名带连字符、轮子文件名里是下划线，两边各写各的，
+# 不要"统一"它们——统一了就成了两个都不对。
+WHEEL_PROJECTS = ("shiboken6", "PySide6-Essentials", "PySide6-Addons", "PySide6")
+WHEEL_FILENAMES = ("shiboken6", "PySide6_Essentials", "PySide6_Addons", "PySide6")
+
+
+def check_wheel_pipeline(root: Path) -> None:
+    """轮子流水线的几条不变量。
+
+    这条流水线存在的全部意义是「用**已经发布**的运行时换掉官方轮子里的文件」，所以最该守住
+    两件事：别再编一遍（那又是一轮几小时），以及发出去的确实是一套装得上、装完对的轮子。
+    """
+    path = root / WHEEL_WORKFLOW
+    if not path.is_file():
+        fail("wheels/workflow", f"missing file {path}")
+        return
+    text = read_text(path)
+
+    # 1. 运行时来自已有的 Release。判据必须是「非注释行上调了 gh release download」：
+    #    文件头的说明里就写着"运行时从已经发布的 Release 里取"，按全文子串搜的话，把取运行时
+    #    那一步整行删掉、注释留着，检查照样通过（本文件里已经踩过两次这个坑）。
+    download = [
+        line
+        for line in text.splitlines()
+        if "gh release download" in line and not line.lstrip().startswith("#")
+    ]
+    if not download:
+        fail(
+            "wheels/source",
+            "workflow 没有从已有 Release 取运行时（gh release download）：这条流水线不该"
+            "重新编一遍 QtWebEngine",
+        )
+    elif not any("$env:WEBENGINE_TAG" in line for line in download):
+        fail(
+            "wheels/source",
+            "gh release download 没有用 WEBENGINE_TAG：标签写死之后，换一个版本就会取到"
+            "错的运行时",
+        )
+    if "inputs.webengine_tag" not in text:
+        fail(
+            "wheels/source",
+            "workflow 不再暴露 webengine_tag 输入：只能取默认标签，运行时无从指定",
+        )
+    if "build.cmd" in text:
+        fail("wheels/source", "轮子流水线里出现了 build.cmd：这条流水线不该编译任何东西")
+
+    # 2. 三个脚本都要真的被调起（判据同 build.cmd 那边：调用，而不是"注释里提到"）
+    called = workflow_invocations(text)
+    for name in WHEEL_SCRIPTS:
+        if not (root / PYSIDE6_DIR / name).is_file():
+            fail("wheels/scripts", f"缺少 {PYSIDE6_DIR}/{name}")
+        if name not in called:
+            fail(
+                "wheels/scripts",
+                f"{PYSIDE6_DIR}/{name} 没有被 workflow 的非注释行实际调用（死代码？）",
+            )
+
+    # 3. "完整一套"要落在脚本里，而不是等用户在 pip 那里撞见
+    fetch = read_text(root / PYSIDE6_DIR / "fetch-pyside6-wheels.py")
+    missing = [name for name in WHEEL_PROJECTS if f'"{name}"' not in fetch]
+    if missing:
+        fail(
+            "wheels/complete",
+            f"fetch-pyside6-wheels.py 的清单少了 {missing}：一套轮子缺一个，"
+            "`--no-index` 安装就会在用户机器上失败",
+        )
+    gate = read_text(root / PYSIDE6_DIR / "verify-wheels.py")
+    unseen = [name for name in WHEEL_FILENAMES if f'"{name}"' not in gate]
+    if unseen:
+        fail(
+            "wheels/complete",
+            f"verify-wheels.py 认不出 {unseen}：少了任何一个，这道门禁就看不出这一套不完整",
+        )
+
+    # 4. 发布必须以"离线装过一次"为前置：装不上的一套轮子不该发出去。
+    #    判据是发布步**显式引用**自测步的 id，而不是全文里有没有 `--no-index`——发布说明的
+    #    正文里就写着那条 pip 命令，按子串搜的话把自测步整段删掉、说明留着，检查照样通过。
+    if not re.search(r"^\s*id: wheelcheck\s*$", text, re.MULTILINE):
+        fail("wheels/gate", "workflow 里的离线安装自测没有 id: wheelcheck：发布步没法引用它的结论")
+    if "steps.wheelcheck.outcome == 'success'" not in text:
+        fail(
+            "wheels/gate",
+            "发布步没有以离线安装自测（steps.wheelcheck）为前置：装不上的一套轮子也会被发出去",
+        )
+
+    # 5. 同一个 tag 重发要覆盖同名资产，而不是判红；匹配不到文件也不该安静地发一个空 Release
+    for needle, why in (
+        ("overwrite_files: true", "重发同一版本时会因为资产已存在而把作业判红"),
+        ("fail_on_unmatched_files: true", "文件没匹配上时会安静地发一个空 Release"),
+    ):
+        if needle not in text:
+            fail("wheels/release", f"发布步少了 {needle}：{why}")
+
+
+# ---------------------------------------------------------------------------
 # 剩下的 PowerShell：workflow 里那十几段内联脚本。迁移之后 .ps1 文件已经没有了，
 # 但 `shell: pwsh` 的步骤还在（预检/页面文件/ccache/Qt 安装/判定/归档/汇总/续跑），
 # 所以这一类坑仍然要守着。
@@ -699,6 +810,7 @@ def main() -> int:
 
     check_build_cmd(root)
     check_workflow(root)
+    check_wheel_pipeline(root)
     check_ccache_wiring(root)
     check_run_py_args(root)
     check_no_powershell_scripts(root)
